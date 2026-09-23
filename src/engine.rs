@@ -194,6 +194,9 @@ impl ConnectionIssue {
     pub fn describe(&self) -> String {
         const HINT: &str = "the doc_url must be an accessible Yandex Docs editor page - disk.yandex.ru links, captcha and login screens have no client-config and can never work";
         match (self.reason.as_str(), self.detail.as_str()) {
+            ("fetch_failed", d) if d.contains("bot check") => {
+                "Yandex is serving the browser-verification page instead of the doc (a bot-check gate on the way to docs.yandex.ru): the engine cannot run its JS. The doc_url itself is likely fine - retry later or use a different network/IP/Cookies; if it stays, open the link in your browser once to warm it".to_string()
+            }
             ("fetch_failed", d) if d.contains("config not found") => {
                 format!("cannot fetch the doc from Yandex (loaded page has no client-config): {HINT}")
             }
@@ -415,6 +418,22 @@ mod tests {
         let issue = connection_issue(&log).expect("config_error is an issue");
         assert_eq!(issue.reason, "config_error");
         assert_eq!(issue.detail, "config not found");
+    }
+
+    #[test]
+    fn describe_distinguishes_bot_check_from_wrong_url() {
+        let bot = ConnectionIssue {
+            reason: "fetch_failed".to_string(),
+            detail: "bot check: Yandex shows the \"верификация\" browser-verification page"
+                .to_string(),
+        };
+        assert!(bot.describe().contains("browser-verification"));
+
+        let wrong = ConnectionIssue {
+            reason: "fetch_failed".to_string(),
+            detail: "config not found".to_string(),
+        };
+        assert!(wrong.describe().contains("client-config"));
     }
 
     #[test]

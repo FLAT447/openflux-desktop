@@ -30,6 +30,7 @@ const I18N = {
     proxyOff: "off",
     proxySystem: "off (system: %s)",
     statusIssue: "issue",
+    issueBotCheck: "Yandex shows its browser-verification (anti-bot) page instead of the doc - the engine cannot run its JS, the doc_url itself is likely fine. Retry later or use another network/IP, or open the link in a browser once to warm it up",
     issueFetchHint: "cannot reach the tunnel doc: the URL must be an accessible Yandex Docs editor page (disk.yandex.ru links, captcha or login pages have no client-config)",
     issueGeneric: "tunnel not connecting (%s: %s)",
     noProfiles: "no profiles; use the CLI to add one",
@@ -84,6 +85,7 @@ const I18N = {
     proxyOff: "выкл",
     proxySystem: "выкл (системно: %s)",
     statusIssue: "проблема",
+    issueBotCheck: "Yandex показывает страницу проверки браузера (анти-бот) вместо документа - движок не может выполнить её JS, сам doc_url скорее всего верный. Повторите позже или смените сеть/IP, либо один раз откройте ссылку в браузере",
     issueFetchHint: "не удаётся получить документ туннеля: URL должен быть страницей редактора Yandex Docs (ссылки disk.yandex.ru, капча и страницы входа не содержат client-config)",
     issueGeneric: "туннель не подключается (%s: %s)",
     noProfiles: "нет профилей; добавьте через CLI",
@@ -270,11 +272,14 @@ async function renderStatus() {
           : t("proxyOff"),
         "warn"
       );
+  const detail = s.issue_detail ?? "";
   const issue = s.issue_reason
     ? pill(
-        s.issue_reason === "fetch_failed" && (s.issue_detail ?? "").includes("config not found")
-          ? t("issueFetchHint")
-          : ts("issueGeneric", s.issue_reason, s.issue_detail ?? ""),
+        s.issue_reason === "fetch_failed" && detail.includes("bot check")
+          ? t("issueBotCheck")
+          : s.issue_reason === "fetch_failed" && detail.includes("config not found")
+            ? t("issueFetchHint")
+            : ts("issueGeneric", s.issue_reason, detail),
         "err"
       )
     : null;
