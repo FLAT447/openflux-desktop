@@ -30,6 +30,13 @@ engine/     Go network engine (WebSocket tunnel, streams, split, DoT/DoH, exit n
 packaging/  install/uninstall scripts and .desktop file
 ```
 
+## Core
+
+This client talks to and tunnels through the OpenFlux server:
+
+[**wlruscfd/openflux-server**](https://github.com/wlruscfd/openflux-server) — the
+controlplane and exit/tunnel infrastructure the client connects to.
+
 ## Building
 
 Linux (needs the Rust/Go toolchains, plus for the GUI: `webkit2gtk-4.1`,

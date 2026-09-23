@@ -30,6 +30,13 @@ engine/     Go-движок (WebSocket-туннель, стримы, split, DoT/
 packaging/  Скрипты установки/удаления и .desktop-файл
 ```
 
+## Ядро
+
+Этот клиент работает с сервером OpenFlux и туннелируется через него:
+
+[**wlruscfd/openflux-server**](https://github.com/wlruscfd/openflux-server) — контроль-плоскость
+и туннельная инфраструктура, к которой подключается клиент.
+
 ## Сборка
 
 Linux (нужны toolchain'и Rust/Go, а для GUI также `webkit2gtk-4.1`, `librsvg`, `dbus`
