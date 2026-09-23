@@ -59,6 +59,9 @@ pub struct Status {
     pub proxy_on: bool,
     /// Current GNOME proxy mode when the proxy is not managed by us ("none", "manual", ...).
     pub proxy_system_mode: Option<String>,
+    /// What the engine log currently says is wrong (e.g. fetch_failed on an unreachable
+    /// doc), when the engine is up but the tunnel has not connected since the failure.
+    pub issue: Option<engine::ConnectionIssue>,
 }
 
 pub fn load(paths: &Paths) -> Result<AppConfig> {
@@ -375,6 +378,7 @@ pub fn status(paths: &Paths) -> Result<Status> {
         exit_up: engine::current_mode(&paths.engine_pid).as_deref() == Some("exit"),
         proxy_on,
         proxy_system_mode,
+        issue: engine::connection_issue(&paths.engine_log),
     })
 }
 

@@ -324,6 +324,13 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
         None => lines.push(Line::from("engine : stopped")),
     }
 
+    if let Some(issue) = &app.status.issue {
+        lines.push(Line::from(Span::styled(
+            format!("warn   : {}", issue.describe()),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+
     if app.status.exit_up {
         lines.push(Line::from(Span::styled(
             "exit   : up (this host egresses tunnel traffic)",

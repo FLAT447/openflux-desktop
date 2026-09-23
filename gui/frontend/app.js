@@ -29,6 +29,9 @@ const I18N = {
     proxyOn: "on",
     proxyOff: "off",
     proxySystem: "off (system: %s)",
+    statusIssue: "issue",
+    issueFetchHint: "cannot reach the tunnel doc: the URL must be an accessible Yandex Docs editor page (disk.yandex.ru links, captcha or login pages have no client-config)",
+    issueGeneric: "tunnel not connecting (%s: %s)",
     noProfiles: "no profiles; use the CLI to add one",
     profilesUnavailable: "profiles unavailable",
     addProfile: "Add profile",
@@ -80,6 +83,9 @@ const I18N = {
     proxyOn: "вкл",
     proxyOff: "выкл",
     proxySystem: "выкл (системно: %s)",
+    statusIssue: "проблема",
+    issueFetchHint: "не удаётся получить документ туннеля: URL должен быть страницей редактора Yandex Docs (ссылки disk.yandex.ru, капча и страницы входа не содержат client-config)",
+    issueGeneric: "туннель не подключается (%s: %s)",
     noProfiles: "нет профилей; добавьте через CLI",
     profilesUnavailable: "профили недоступны",
     addProfile: "Добавить профиль",
@@ -264,11 +270,20 @@ async function renderStatus() {
           : t("proxyOff"),
         "warn"
       );
+  const issue = s.issue_reason
+    ? pill(
+        s.issue_reason === "fetch_failed" && (s.issue_detail ?? "").includes("config not found")
+          ? t("issueFetchHint")
+          : ts("issueGeneric", s.issue_reason, s.issue_detail ?? ""),
+        "err"
+      )
+    : null;
   statusRows.innerHTML = `
     <div class="row"><span class="k">${t("statusProfile")}</span><span>${escapeHtml(s.active_profile ?? "<none>")}</span></div>
     <div class="row"><span class="k">${t("statusEngine")}</span>${engine}</div>
     <div class="row"><span class="k">${t("statusTun")}</span>${tun}</div>
-    <div class="row"><span class="k">${t("statusProxy")}</span>${proxy}</div>`;
+    <div class="row"><span class="k">${t("statusProxy")}</span>${proxy}</div>
+    ${issue ? `<div class="row"><span class="k">${t("statusIssue")}</span>${issue}</div>` : ""}`;
   renderStatic();
 }
 

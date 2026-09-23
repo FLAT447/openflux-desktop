@@ -249,6 +249,9 @@ fn main() -> Result<()> {
                 "engine running (pid {}), SOCKS5 at 127.0.0.1:{}\n  next: `openflux tun on` (sudo) or `openflux proxy on`",
                 o.pid, o.port
             );
+            if let Some(issue) = engine::connection_issue(&ctx.paths.engine_log) {
+                println!("  warning: {}", issue.describe());
+            }
             Ok(())
         }
         Command::Disconnect => {

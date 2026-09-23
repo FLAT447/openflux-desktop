@@ -177,6 +177,84 @@ pub fn start_exit(cfg: &EngineConfig, timeout: Duration) -> Result<i32> {
     }
 }
 
+/// A connection problem extracted from the engine log tail: the most recent
+/// `event retrying (...)` / `event config_error (...)` that the tunnel has not
+/// since recovered from, plus the raw cause carried by the engine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectionIssue {
+    /// Engine reason code (e.g. "fetch_failed", "config_error").
+    pub reason: String,
+    /// Engine-supplied detail (e.g. "config not found").
+    pub detail: String,
+}
+
+impl ConnectionIssue {
+    /// Human-readable summary. English by design (CLI/TUI); the GUI localizes the
+    /// reason/detail pair itself.
+    pub fn describe(&self) -> String {
+        const HINT: &str = "the doc_url must be an accessible Yandex Docs editor page - disk.yandex.ru links, captcha and login screens have no client-config and can never work";
+        match (self.reason.as_str(), self.detail.as_str()) {
+            ("fetch_failed", d) if d.contains("config not found") => {
+                format!("cannot fetch the doc from Yandex (loaded page has no client-config): {HINT}")
+            }
+            ("config_error", d) => format!("the doc config was never obtained ({d}): {HINT}"),
+            (r, "") => format!("tunnel not connecting ({r})"),
+            (r, d) => format!("tunnel not connecting ({r}: {d})"),
+        }
+    }
+}
+
+/// Scan the tail of the engine log for the most recent failing/retrying tunnel state.
+/// Returns `None` when nothing is failing, or when a later `event connected` superseded
+/// the last failure (so stale messages from a recovered session don't surface).
+pub fn connection_issue(log_file: &Path) -> Option<ConnectionIssue> {
+    const TAIL: u64 = 256 * 1024;
+    let data = std::fs::read(log_file).ok()?;
+    let text = &data[data.len().saturating_sub(TAIL as usize)..];
+
+    let mut last_retry: Option<(usize, ConnectionIssue)> = None;
+    let mut last_connected: Option<usize> = None;
+    for (idx, line) in text.split(|b| *b == b'\n').enumerate() {
+        let line = String::from_utf8_lossy(line);
+        if let Some(issue) = parse_engine_issue(&line) {
+            last_retry = Some((idx, issue));
+        } else if line.contains("event connected (") {
+            last_connected = Some(idx);
+        }
+    }
+
+    let (idx, issue) = last_retry?;
+    if last_connected.is_some_and(|c| c > idx) {
+        return None;
+    }
+    Some(issue)
+}
+
+/// Parse an engine event line into a (reason, detail) pair, or `None` for unrelated
+/// lines. Understands `event retrying (attempt N|delay|reason|cause)` and the terminal
+/// `event config_error (cause)` emitted by the core when a config fetch is a dead end.
+fn parse_engine_issue(line: &str) -> Option<ConnectionIssue> {
+    const RETRY: &str = "event retrying (attempt ";
+    const CONFIG_ERR: &str = "event config_error (";
+    if let Some(rest) = line.split_once(RETRY) {
+        let inner = rest.1.strip_suffix(')')?;
+        let fields: Vec<&str> = inner.splitn(4, '|').collect();
+        if fields.len() >= 3 {
+            return Some(ConnectionIssue {
+                reason: fields[2].to_string(),
+                detail: fields.get(3).copied().unwrap_or_default().to_string(),
+            });
+        }
+    }
+    if let Some(rest) = line.split_once(CONFIG_ERR) {
+        return Some(ConnectionIssue {
+            reason: "config_error".to_string(),
+            detail: rest.1.strip_suffix(')').unwrap_or(rest.1).to_string(),
+        });
+    }
+    None
+}
+
 /// The pidfile path lives next to the engine log's directory.
 fn engine_pidfile(cfg: &EngineConfig) -> PathBuf {
     cfg.log_file.with_file_name("engine.pid")
@@ -300,6 +378,43 @@ mod tests {
     #[test]
     fn socks_addr_has_correct_shape() {
         assert_eq!(socks_addr(1080), "127.0.0.1:1080");
+    }
+
+    #[test]
+    fn connection_issue_surfaces_unsuperseded_retries() {
+        use std::io::Write;
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("engine.log");
+        let mut f = std::fs::File::create(&log).unwrap();
+        writeln!(f, "01:00:00 [TUNNEL] event connected (attempt 1)").unwrap();
+        writeln!(f, "01:01:00 [TUNNEL] event retrying (attempt 2|3|fetch_failed|config not found)").unwrap();
+        f.flush().unwrap();
+        let issue = connection_issue(&log);
+        assert!(issue.is_some(), "latest line is a retry, must surface it");
+        let issue = issue.unwrap();
+        assert_eq!(issue.reason, "fetch_failed");
+        assert_eq!(issue.detail, "config not found");
+
+        writeln!(
+            f,
+            "01:02:00 [TUNNEL] event connected (attempt 3) and traffic flows again"
+        )
+        .unwrap();
+        f.flush().unwrap();
+        assert_eq!(connection_issue(&log), None, "recovery supersedes the retry");
+    }
+
+    #[test]
+    fn connection_issue_parses_terminal_config_error() {
+        use std::io::Write;
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("engine.log");
+        let mut f = std::fs::File::create(&log).unwrap();
+        writeln!(f, "01:00:00 [TUNNEL] event config_error (config not found)").unwrap();
+        f.flush().unwrap();
+        let issue = connection_issue(&log).expect("config_error is an issue");
+        assert_eq!(issue.reason, "config_error");
+        assert_eq!(issue.detail, "config not found");
     }
 
     #[test]

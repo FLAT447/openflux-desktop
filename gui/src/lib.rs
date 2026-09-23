@@ -77,6 +77,9 @@ struct StatusView {
     exit_up: bool,
     proxy_on: bool,
     proxy_system_mode: Option<String>,
+    /// Tunnel problem read from the engine log (reason/detail pair, localized in the UI).
+    issue_reason: Option<String>,
+    issue_detail: Option<String>,
 }
 
 fn to_rich<T>(result: Result<T, anyhow::Error>) -> Result<T, String> {
@@ -115,6 +118,8 @@ fn status(ctx: tauri::State<'_, Ctx>) -> Result<StatusView, String> {
         exit_up: s.exit_up,
         proxy_on: s.proxy_on,
         proxy_system_mode: s.proxy_system_mode.clone(),
+        issue_reason: s.issue.as_ref().map(|i| i.reason.clone()),
+        issue_detail: s.issue.as_ref().map(|i| i.detail.clone()),
     })
 }
 
