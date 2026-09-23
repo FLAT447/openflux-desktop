@@ -59,8 +59,8 @@ make install-gui
 Релизные пакеты:
 
 ```sh
-make dist GUI=1            # Linux: tar.gz + zip в dist/
-make dist-windows GUI=1    # Windows: сборка + wintun.dll (нужны mingw-w64 и rustup target)
+make dist GUI=1            # Linux: tar.gz в dist/ (имя вида openflux-<ver>-linux-<arch>)
+make dist-windows GUI=1    # Windows: zip (openflux-<ver>-windows-<arch>.zip) + wintun.dll (нужны mingw-w64 и rustup target)
 ```
 
 ## Использование
