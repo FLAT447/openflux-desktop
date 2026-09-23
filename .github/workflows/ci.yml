@@ -128,7 +128,7 @@ jobs:
           cp README.ru.md dist/windows-x86_64/ 2>/dev/null || true
           cp LICENSE dist/windows-x86_64/ 2>/dev/null || true
           curl -fsSL -o wintun.zip https://www.wintun.net/builds/wintun-0.14.1.zip
-          unzip -jo wintun.zip 'bin/amd64/wintun.dll' -d dist/windows-x86_64/
+          unzip -jo wintun.zip 'wintun/bin/amd64/wintun.dll' -d dist/windows-x86_64/
 
       - name: Zip bundle
         shell: bash

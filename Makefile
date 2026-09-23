@@ -86,7 +86,7 @@ dist-windows: cargo-windows engine-windows
 	else \
 		echo "wintun.dll: downloading $(WINTUN_URL)"; \
 		curl -fSL -o /tmp/wintun.zip $(WINTUN_URL) && \
-		unzip -jo /tmp/wintun.zip 'bin/amd64/wintun.dll' -d dist/$(DIST_NAME_WIN)/ && \
+		unzip -jo /tmp/wintun.zip 'wintun/bin/amd64/wintun.dll' -d dist/$(DIST_NAME_WIN)/ && \
 		rm -f /tmp/wintun.zip; \
 	fi
 	@cd dist/$(DIST_NAME_WIN) && zip -qr ../$(DIST_NAME_WIN).zip .
