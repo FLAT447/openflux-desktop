@@ -132,7 +132,9 @@ jobs:
 
       - name: Zip bundle
         shell: bash
-        run: cd dist && zip -qr openflux-${GITHUB_REF_NAME#v}-windows-x86_64.zip windows-x86_64
+        run: |
+          VER=${GITHUB_REF_NAME#v}
+          powershell -Command "Compress-Archive -Path dist/windows-x86_64/* -DestinationPath dist/openflux-${VER}-windows-x86_64.zip -Force"
 
       - uses: actions/upload-artifact@v4
         with:
