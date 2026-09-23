@@ -189,6 +189,13 @@ func startWatchdog(ctx context.Context, mode string, counter func() uint64, conn
 	}()
 }
 
+// packetsRecv is the watchdog's received-packet counter: the gateway/tunnel no longer
+// expose their own counter, but the transport stack does (and for multistream it is
+// already the aggregate across streams).
+func packetsRecv(trans transport.Transport) func() uint64 {
+	return func() uint64 { return trans.Stats().PacketsRecv }
+}
+
 // runTunMode wires the gvisor gateway to the TUN device the CLI created, giving full-system
 // TCP/UDP/DNS through the tunnel (the same role mobile.StartTunnel plays on Android).
 // Split-tunnel and DNS-policy apply here: the gateway decides per destination whether to
@@ -210,7 +217,7 @@ func runTunMode(ctx context.Context, r io.Reader, w io.Writer, dns, splitMode, s
 	log.Printf("ready tun dns=%s", dns)
 	// from here on, the gateway speaks for the interface; the watchdog keeps engine.log
 	// honest about whether packets are actually flowing.
-	startWatchdog(ctx, "tun", gw.RecvPackets, trans)
+	startWatchdog(ctx, "tun", packetsRecv(trans), trans)
 	<-ctx.Done()
 }
 
@@ -229,7 +236,7 @@ func runSocksMode(ctx context.Context, addr string, tun *tunnel.TCPTunnel, trans
 
 	serverErr := make(chan error, 1)
 	go func() { serverErr <- server.Start() }()
-	startWatchdog(ctx, "socks", tun.RecvPackets, trans)
+	startWatchdog(ctx, "socks", packetsRecv(trans), trans)
 
 	select {
 	case err := <-serverErr:
@@ -247,7 +254,7 @@ func runSocksMode(ctx context.Context, addr string, tun *tunnel.TCPTunnel, trans
 // and dialed for real from this machine. No TUN device or local listener is involved.
 func runExitMode(ctx context.Context, tun *tunnel.TCPTunnel, trans transport.Transport) {
 	log.Printf("ready exit node (mode %s)", tun.ExitMode())
-	startWatchdog(ctx, "exit", tun.RecvPackets, trans)
+	startWatchdog(ctx, "exit", packetsRecv(trans), trans)
 	<-ctx.Done()
 }
 

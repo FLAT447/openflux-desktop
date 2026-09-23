@@ -1,0 +1,58 @@
+name: sync-engine
+
+# Re-vendor the engine's core dependency (openflux-server) and open a PR when the
+# vendored snapshot drifts. Runs on a schedule and on demand:
+#   gh workflow run sync-engine.yml                 # sync from core's default branch
+#   gh workflow run sync-engine.yml -f ref=v1.2.0   # sync from a specific core tag/commit
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "openflux-server ref to sync from (tag, branch or commit)"
+        required: false
+        default: HEAD
+  schedule:
+    - cron: "0 3 * * 1" # every Monday 03:00 UTC
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      # Layout matters: engine/go.mod replaces `universal-bypass-tool` with
+      # `../../openflux-server`, i.e. a sibling checkout of the core repo.
+      - uses: actions/checkout@v4
+        with:
+          path: openflux-desktop
+
+      - uses: actions/checkout@v4
+        with:
+          repository: wlruscfd/openflux-server
+          ref: ${{ inputs.ref || '' }}
+          path: openflux-server
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+
+      - name: Sync engine from core
+        run: ./scripts/update-engine.sh
+        working-directory: openflux-desktop
+
+      - name: Open PR if the snapshot changed
+        uses: peter-evans/create-pull-request@v6
+        with:
+          path: openflux-desktop
+          add-paths: |
+            engine/vendor
+            engine/core.rev
+            engine/go.sum
+            engine/go.mod
+          commit-message: "chore: sync engine from openflux-server"
+          branch: ci/sync-engine
+          delete-branch: true
+          title: "chore: sync engine from core (${{ github.sha }})"
+          body: |
+            Automated refresh of engine/vendor from [openflux-server](https://github.com/wlruscfd/openflux-server).
+            `engine/core.rev` records the exact core revision that was vendored.
+            Review the engine diff before merging — protocol changes may need client-side adjustments.

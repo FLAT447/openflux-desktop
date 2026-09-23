@@ -368,12 +368,6 @@ func (t *TCPTunnel) ListenTCP(port uint16) (net.Listener, error) {
 	}, ipv4.ProtocolNumber)
 }
 
-// RecvPackets returns how many IP packets the tunnel's gvisor stack has received since
-// start; the engine's watchdog uses it to tell an idle-but-up tunnel apart from a live one.
-func (t *TCPTunnel) RecvPackets() uint64 {
-	return t.gvisorStack.Stats().IP.PacketsReceived.Value()
-}
-
 func (t *TCPTunnel) printStats() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()

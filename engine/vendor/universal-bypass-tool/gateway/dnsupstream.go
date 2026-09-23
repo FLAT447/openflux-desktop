@@ -68,19 +68,36 @@ func parseDNSUpstream(raw string) dnsUpstreamConfig {
 	}
 }
 
+// dnsFallbackUpstream is tried, still through the tunnel, when the configured upstream fails outright - one fixed resolver with nothing behind it was a real single point of failure (confirmed live: the default 77.88.8.8 getting reset on some exit-node networks took down DNS, and with it everything, even though the tunnel itself was fine).
+const dnsFallbackUpstream = "1.1.1.1:53"
+
 func (s *Server) queryUpstream(query []byte) ([]byte, error) {
+	reply, err := s.queryConfiguredUpstream(query)
+	if err == nil {
+		return reply, nil
+	}
+	if s.dnsUpstreamCfg.kind == dnsUpstreamPlain && s.dnsUpstreamCfg.addr == dnsFallbackUpstream {
+		return nil, err
+	}
+	if fallback, ferr := s.queryPlainDNSAt(dnsFallbackUpstream, query); ferr == nil {
+		return fallback, nil
+	}
+	return nil, err
+}
+
+func (s *Server) queryConfiguredUpstream(query []byte) ([]byte, error) {
 	switch s.dnsUpstreamCfg.kind {
 	case dnsUpstreamDoT:
 		return s.queryDoT(query)
 	case dnsUpstreamDoH:
 		return s.queryDoH(query)
 	default:
-		return s.queryPlainDNS(query)
+		return s.queryPlainDNSAt(s.dnsUpstreamCfg.addr, query)
 	}
 }
 
-func (s *Server) queryPlainDNS(query []byte) ([]byte, error) {
-	conn, err := s.dialer.DialTCP(s.dnsUpstreamCfg.addr)
+func (s *Server) queryPlainDNSAt(addr string, query []byte) ([]byte, error) {
+	conn, err := s.dialer.DialTCP(addr)
 	if err != nil {
 		return nil, fmt.Errorf("dial: %w", err)
 	}

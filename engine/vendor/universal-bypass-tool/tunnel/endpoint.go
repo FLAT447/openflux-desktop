@@ -59,6 +59,10 @@ func (e *TunnelLinkEndpoint) InjectInbound(data []byte) {
 	if len(data) < 20 || (data[9] != 6 && data[9] != 17) {
 		return
 	}
+	// Same class of bug fixed in rawsocket_linux.go's reader: a declared IHL bigger than the actual buffer (corrupt data, or a batch/regex decode that let non-packet bytes through) crashes gvisor's own parsing instead of erroring.
+	if ihl := int(data[0]&0x0F) * 4; ihl < 20 || ihl > len(data) {
+		return
+	}
 
 	// gvisor panics on some inputs instead of erroring (seen in production: "unexpected transport protocol = 0"); this runs on a shared goroutine so an unrecovered panic takes the whole process down.
 	defer func() {

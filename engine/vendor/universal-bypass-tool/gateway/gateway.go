@@ -56,14 +56,6 @@ func (s *Server) SetMTU(mtu uint32) {
 	s.mtu = mtu
 }
 
-// RecvPackets returns how many IP packets the gateway stack has received from the link
-// layer since start. A gateway that reports steady zero packets while the transport says it
-// is connected is effectively black-holing the interface - surfaced by the engine's
-// watchdog so TUN mode never fails silently again.
-func (s *Server) RecvPackets() uint64 {
-	return s.gvisorStack.Stats().IP.PacketsReceived.Value()
-}
-
 func NewServer(dialer Dialer, dnsUpstream string) *Server {
 	return NewServerWithPolicy(dialer, dnsUpstream, nil)
 }
