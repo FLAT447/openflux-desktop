@@ -1,0 +1,25 @@
+# Rust build output
+/target
+/gui/target
+
+# Copied launcher binaries and release bundles
+/bin
+/dist
+
+# Go engine binaries
+/engine/openflux-engine
+/engine/openflux-engine.exe
+
+# Wintun driver (downloaded / bundled at package time)
+wintun.dll
+/wintun
+
+# Logs and stray state
+*.log
+*.pid
+
+# Editor / OS cruft
+.DS_Store
+*.swp
+*~.agents/
+skills-lock.json

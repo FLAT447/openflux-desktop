@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>OpenFlux</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <span class="logo">⚡</span>
+      <span data-i18n="brand">OpenFlux</span>
+    </div>
+    <div class="actions">
+      <button id="btn-connect" class="btn primary">Connect</button>
+      <button id="btn-tun" class="btn">TUN&nbsp;…</button>
+      <button id="btn-proxy" class="btn">Proxy&nbsp;…</button>
+      <button id="btn-lang" class="btn ghost" title="Language">EN</button>
+      <button id="btn-refresh" class="btn ghost" title="Refresh">↻</button>
+    </div>
+  </header>
+
+  <main>
+    <section id="profiles" class="panel">
+      <h2>
+        <span data-i18n="profiles">Profiles</span>
+        <span class="btns"><button id="btn-import" class="btn small" title="Import link">⇩</button><button id="btn-add" class="btn small" title="Add">＋</button></span>
+      </h2>
+      <ul id="profile-list"></ul>
+    </section>
+
+    <section id="dash" class="column">
+      <div id="status" class="panel">
+        <h2 data-i18n="status">Status</h2>
+        <div id="status-rows"></div>
+        <div id="message" class="message"></div>
+      </div>
+
+      <div id="log" class="panel grow">
+        <h2 data-i18n="engineLog">Engine log</h2>
+        <pre id="log-view"></pre>
+      </div>
+    </section>
+  </main>
+
+  <div id="modal" class="modal hidden">
+    <div class="modal-box">
+      <h3 data-i18n="addProfile">Add profile</h3>
+      <label data-i18n="fName">Name</label>
+      <input id="f-name" placeholder="my-profile" />
+      <label data-i18n="fMode">Mode</label>
+      <select id="f-mode">
+        <option value="manual" data-i18n="fManual">Manual (doc URL)</option>
+        <option value="key" data-i18n="fKey">Key (controlplane)</option>
+      </select>
+      <div id="f-manual-row">
+        <label data-i18n="fDocUrl">Yandex Docs URL</label>
+        <input id="f-doc-url" type="url" placeholder="https://docs.yandex.ru/…" />
+      </div>
+      <div id="f-key-row" class="hidden">
+        <label data-i18n="fControlUrl">Controlplane base URL</label>
+        <input id="f-control-url" type="url" placeholder="https://control.example.com" />
+        <label data-i18n="fKeyToken">Key token</label>
+        <input id="f-key-token" placeholder="key_t_…" />
+      </div>
+      <label data-i18n="fPort">SOCKS5 port (default 1080)</label>
+      <input id="f-port" type="number" min="0" max="65535" placeholder="1080" />
+      <label data-i18n="fStreams">Streams (multistream, 1-8)</label>
+      <input id="f-streams" type="number" min="1" max="8" placeholder="1" />
+      <label data-i18n="fDns">DNS upstream for TUN (plain ip / tls://host / https://host/path)</label>
+      <input id="f-dns" placeholder="77.88.8.8" />
+      <label data-i18n="fSplitMode">TUN split mode</label>
+      <select id="f-split-mode">
+        <option value="none" data-i18n="fSplitOff">Off</option>
+        <option value="exclude" data-i18n="fSplitExclude">Exclude (list bypasses the tunnel)</option>
+        <option value="include" data-i18n="fSplitInclude">Include (only list uses it)</option>
+      </select>
+      <label data-i18n="fSplitDomains">Split domains (comma-separated, *.ya.ru)</label>
+      <input id="f-split-domains" placeholder="*.ya.ru,example.com" />
+      <div class="modal-actions">
+        <button id="btn-modal-cancel" class="btn" data-i18n="btnCancel">Cancel</button>
+        <button id="btn-modal-save" class="btn primary" data-i18n="btnSave">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="modal-import" class="modal hidden">
+    <div class="modal-box">
+      <h3 data-i18n="importTitle">Import from link</h3>
+      <label data-i18n="fLink">OpenFlux link or raw base64 payload</label>
+      <textarea id="f-link" rows="3" spellcheck="false" placeholder="openflux://import?data=…"></textarea>
+      <div class="modal-actions">
+        <button id="btn-import-cancel" class="btn" data-i18n="btnCancel">Cancel</button>
+        <button id="btn-import-save" class="btn primary" data-i18n="btnImport">Import</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

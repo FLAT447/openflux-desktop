@@ -1,0 +1,55 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install GUI build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file \
+            libssl-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Lint (clippy -D warnings + go vet)
+        run: make lint
+
+      - name: Test (cargo test)
+        run: make test
+
+      - name: Engine build (GOOS=windows)
+        working-directory: engine
+        run: GOOS=windows CGO_ENABLED=0 go build -mod=vendor -o /tmp/openflux-engine.exe .
+
+  windows-build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Compile-verify the Windows native targets (CLI + Tauri GUI + engine); there is
+      # no Windows machine locally, so this is the only place the Windows path runs.
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Build CLI + GUI (debug)
+        shell: bash
+        run: |
+          cargo build --locked
+          cargo build --locked --manifest-path gui/Cargo.toml
+
+      - name: Build engine (GOOS=windows)
+        shell: bash
+        run: cd engine && GOOS=windows CGO_ENABLED=0 go build -mod=vendor -o openflux-engine.exe .

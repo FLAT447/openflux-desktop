@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=OpenFlux
+GenericName=VPN client
+Comment=OpenFlux desktop client: TUN mode and system proxy
+Exec=/usr/local/bin/openflux-gui %u
+Icon=openflux
+Terminal=false
+Categories=Network;
+Keywords=VPN;tunnel;proxy;
+MimeType=x-scheme-handler/openflux;
