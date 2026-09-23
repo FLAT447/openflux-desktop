@@ -1,11 +1,22 @@
-name: ci
+name: ci-cd
+
+# Single workflow, two concerns:
+#   CI   -> lint + test + Windows-native compile check (branch pushes and PRs)
+#   CD   -> Linux & Windows release bundles + GitHub Release (tag pushes v*)
+# Release jobs run only when this run was triggered by a `v*` tag; everything else
+# is gated off on branch/PR runs.
 
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
 
+permissions:
+  contents: write
+
 jobs:
+  # ------------------------------------------------------------------ CI
   lint-and-test:
     runs-on: ubuntu-latest
     steps:
@@ -28,10 +39,6 @@ jobs:
       - name: Test (cargo test)
         run: make test
 
-      - name: Engine build (GOOS=windows)
-        working-directory: engine
-        run: GOOS=windows CGO_ENABLED=0 go build -mod=vendor -o /tmp/openflux-engine.exe .
-
   windows-build:
     runs-on: windows-latest
     steps:
@@ -53,3 +60,98 @@ jobs:
       - name: Build engine (GOOS=windows)
         shell: bash
         run: cd engine && GOOS=windows CGO_ENABLED=0 go build -mod=vendor -o openflux-engine.exe .
+
+  # ------------------------------------------------------------------ CD (tag-only)
+  linux-release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [lint-and-test, windows-build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install GUI build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file \
+            libssl-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev zip
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Build release bundle
+        run: make dist GUI=1 VERSION=${GITHUB_REF_NAME#v}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-bundle
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+          if-no-files-found: error
+
+  windows-release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [lint-and-test, windows-build]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The Tauri webview cannot be cross-compiled from Linux, so the Windows bundle is
+      # built natively on a Windows runner (MSVC). Git for Windows already ships the
+      # bash toolchain (curl/zip/unzip) used below.
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Build CLI + GUI
+        shell: bash
+        run: |
+          cargo build --release --locked
+          cargo build --release --locked --manifest-path gui/Cargo.toml
+
+      - name: Build Go engine
+        shell: bash
+        run: cd engine && GOOS=windows CGO_ENABLED=0 go build -mod=vendor -o openflux-engine.exe .
+
+      - name: Assemble bundle
+        shell: bash
+        run: |
+          mkdir -p dist/windows-x86_64
+          cp target/release/openflux.exe dist/windows-x86_64/openflux.exe
+          cp gui/target/release/openflux-gui.exe dist/windows-x86_64/openflux-gui.exe
+          cp engine/openflux-engine.exe dist/windows-x86_64/openflux-engine.exe
+          cp packaging/install.cmd packaging/uninstall.cmd dist/windows-x86_64/
+          cp README.md dist/windows-x86_64/ 2>/dev/null || true
+          cp README.ru.md dist/windows-x86_64/ 2>/dev/null || true
+          cp LICENSE dist/windows-x86_64/ 2>/dev/null || true
+          curl -fsSL -o wintun.zip https://www.wintun.net/builds/wintun-0.14.1.zip
+          unzip -jo wintun.zip 'bin/amd64/wintun.dll' -d dist/windows-x86_64/
+
+      - name: Zip bundle
+        shell: bash
+        run: cd dist && zip -qr openflux-${GITHUB_REF_NAME#v}-windows-x86_64.zip windows-x86_64
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-zip
+          path: dist/*-windows-x86_64.zip
+          if-no-files-found: error
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux-release, windows-release]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: artifacts/*

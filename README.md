@@ -1,5 +1,7 @@
 # OpenFlux desktop client
 
+**English** | [Русский](README.ru.md)
+
 A desktop client for a [Yandex Docs](https://yandex.ru/dev/docs/)–style controlplane
 ("docs-as-congress" tunnel config). One manager process (`openflux`) and a Go engine
 (`openflux-engine`) give you:
