@@ -809,6 +809,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn flags_are_parsed_whatever_the_engine_accepted() {
         // The engine is Go: its `flag` package takes `-socks5` and `--socks5` alike, and the
@@ -858,6 +859,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[test]
     fn only_a_process_invoked_as_the_engine_counts_as_one() {
         // A shell that merely mentions the engine path is not the engine: matching the name

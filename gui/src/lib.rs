@@ -398,6 +398,10 @@ async fn disconnect(ctx: tauri::State<'_, Ctx>) -> Result<String, String> {
     // Hand the whole teardown to the privileged entry point, the same one the TUN toggle uses.
     #[cfg(unix)]
     let mut privileged = String::new();
+    // Windows has no pkexec: the unprivileged pass below does the whole teardown, so there is
+    // never a privileged message to prepend.
+    #[cfg(not(unix))]
+    let privileged = String::new();
     #[cfg(unix)]
     {
         let st = to_rich(actions::status(&ctx.paths))?;
