@@ -1,6 +1,6 @@
 [package]
 name = "openflux"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "OpenFlux desktop client (CLI): TUN mode and system proxy on/off, engine in Go"
 license = "GPL-3.0-or-later"

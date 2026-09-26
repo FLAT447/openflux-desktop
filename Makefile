@@ -36,7 +36,7 @@ install-gui: gui
 
 # Distributable release: tarball (Linux). Binaries are laid out flat so the engine
 # and the CLI/gui sit next to each other and the launcher's relative paths hold.
-VERSION ?= 0.1.0
+VERSION ?= 0.1.1
 DIST_NAME := openflux-$(VERSION)-linux-$(shell uname -m)
 GUI ?= 0
 # A GUI binary left in bin/ by an earlier build must never be shipped as if it were
