@@ -45,8 +45,8 @@ GUI ?= 0
 # `make dist` therefore never bundles a stale openflux-gui - the failure mode where the
 # old binary rejects transports the new one supports.
 dist: cargo engine
-	@if [ "$(GUI)" = 1 ] || [ -f bin/openflux-gui ]; then $(MAKE) gui && cp -f gui/target/release/openflux-gui bin/openflux-gui; else echo "no GUI requested (GUI=0) and no bin/openflux-gui: bundling CLI + engine only"; fi
 	@mkdir -p bin
+	@if [ "$(GUI)" = 1 ] || [ -f bin/openflux-gui ]; then $(MAKE) gui && cp -f gui/target/release/openflux-gui bin/openflux-gui; else echo "no GUI requested (GUI=0) and no bin/openflux-gui: bundling CLI + engine only"; fi
 	@cp -f target/release/openflux bin/openflux
 	@rm -rf dist/$(DIST_NAME) dist/$(DIST_NAME).tar.gz
 	@mkdir -p dist/$(DIST_NAME)
@@ -105,6 +105,7 @@ engine-windows:
 
 gui-windows:
 	cargo build --release --locked --target $(WIN_TARGET) --manifest-path gui/Cargo.toml
+	@mkdir -p bin
 	@cp -f gui/target/$(WIN_TARGET)/release/openflux-gui.exe bin/openflux-gui.exe
 
 test:
