@@ -26,7 +26,12 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file \
-            libssl-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
+            libssl-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev llvm
+          # llvm-rc embeds the Windows manifest and icon when the Windows cfg of the GUI is
+          # checked below. Debian ships it versioned under /usr/lib/llvm-*/bin, while the
+          # tauri build script looks for an unversioned llvm-rc on PATH.
+          command -v llvm-rc >/dev/null \
+            || sudo ln -sf "$(ls -1 /usr/lib/llvm-*/bin/llvm-rc | head -1)" /usr/local/bin/llvm-rc
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-go@v5
