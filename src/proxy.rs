@@ -29,7 +29,10 @@ pub struct ProxyState {
 
 fn have(bin: &str) -> bool {
     // Cheap PATH probe: run `command -v`.
-    if let Ok(out) = Command::new("sh").args(["-c", &format!("command -v {bin}")]).output() {
+    if let Ok(out) = Command::new("sh")
+        .args(["-c", &format!("command -v {bin}")])
+        .output()
+    {
         return out.status.success() && !out.stdout.is_empty();
     }
     false
@@ -46,7 +49,10 @@ pub fn detect_backend() -> Backend {
 }
 
 fn gs_get(key: &str) -> Option<String> {
-    let out = Command::new("gsettings").args(["get", GS_SCHEMA, key]).output().ok()?;
+    let out = Command::new("gsettings")
+        .args(["get", GS_SCHEMA, key])
+        .output()
+        .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -60,7 +66,10 @@ fn gs_set(key: &str, value: &str) -> Result<()> {
         .output()
         .context("run gsettings")?;
     if !out.status.success() {
-        anyhow::bail!("gsettings set {key} failed: {}", String::from_utf8_lossy(&out.stderr));
+        anyhow::bail!(
+            "gsettings set {key} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
     Ok(())
 }
@@ -71,17 +80,28 @@ fn gs_socks_set(key: &str, value: &str) -> Result<()> {
         .output()
         .context("run gsettings (socks)")?;
     if !out.status.success() {
-        anyhow::bail!("gsettings set {key} failed: {}", String::from_utf8_lossy(&out.stderr));
+        anyhow::bail!(
+            "gsettings set {key} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
     Ok(())
 }
 
 fn gs_socks_get(key: &str) -> Option<String> {
-    let out = Command::new("gsettings").args(["get", "org.gnome.system.proxy.socks", key]).output().ok()?;
+    let out = Command::new("gsettings")
+        .args(["get", "org.gnome.system.proxy.socks", key])
+        .output()
+        .ok()?;
     if !out.status.success() {
         return None;
     }
-    Some(String::from_utf8_lossy(&out.stdout).trim().trim_matches('\'').to_string())
+    Some(
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .trim_matches('\'')
+            .to_string(),
+    )
 }
 
 pub fn on(socks_port: u16, state_file: &Path) -> Result<Backend> {
@@ -111,27 +131,54 @@ pub fn on(socks_port: u16, state_file: &Path) -> Result<Backend> {
             prev
         }
         Backend::Kde => {
-            let exe = if have("kwriteconfig6") { "kwriteconfig6" } else { "kwriteconfig5" };
+            let exe = if have("kwriteconfig6") {
+                "kwriteconfig6"
+            } else {
+                "kwriteconfig5"
+            };
             let _ = Command::new(exe)
                 .args([
-                    "--file", "kioslaverc", "--group", "Proxy Settings", "--key", "ProxyType",
-                    "--new", "1",
+                    "--file",
+                    "kioslaverc",
+                    "--group",
+                    "Proxy Settings",
+                    "--key",
+                    "ProxyType",
+                    "--new",
+                    "1",
                 ])
                 .status();
             let _ = Command::new(exe)
                 .args([
-                    "--file", "kioslaverc", "--group", "Proxy Settings", "--key", "SocksProxy",
-                    "--new", "127.0.0.1",
+                    "--file",
+                    "kioslaverc",
+                    "--group",
+                    "Proxy Settings",
+                    "--key",
+                    "SocksProxy",
+                    "--new",
+                    "127.0.0.1",
                 ])
                 .status();
             let _ = Command::new(exe)
                 .args([
-                    "--file", "kioslaverc", "--group", "Proxy Settings", "--key", "SocksPort",
-                    "--new", &socks_port.to_string(),
+                    "--file",
+                    "kioslaverc",
+                    "--group",
+                    "Proxy Settings",
+                    "--key",
+                    "SocksPort",
+                    "--new",
+                    &socks_port.to_string(),
                 ])
                 .status();
             notify_kde();
-            ProxyState { backend, prev_mode: None, prev_socks_host: None, prev_socks_port: None }
+            ProxyState {
+                backend,
+                prev_mode: None,
+                prev_socks_host: None,
+                prev_socks_port: None,
+            }
         }
         Backend::Unsupported => anyhow::bail!(
             "no supported system-proxy backend found (need gsettings or kwriteconfig5/6); \
@@ -167,11 +214,21 @@ pub fn off(state_file: &Path) -> Result<()> {
             }
         }
         Backend::Kde => {
-            let exe = if have("kwriteconfig6") { "kwriteconfig6" } else { "kwriteconfig5" };
+            let exe = if have("kwriteconfig6") {
+                "kwriteconfig6"
+            } else {
+                "kwriteconfig5"
+            };
             let _ = Command::new(exe)
                 .args([
-                    "--file", "kioslaverc", "--group", "Proxy Settings", "--key", "ProxyType",
-                    "--new", "0",
+                    "--file",
+                    "kioslaverc",
+                    "--group",
+                    "Proxy Settings",
+                    "--key",
+                    "ProxyType",
+                    "--new",
+                    "0",
                 ])
                 .status();
             notify_kde();

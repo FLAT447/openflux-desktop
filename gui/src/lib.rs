@@ -10,7 +10,7 @@ use serde::Serialize;
 use tauri::Manager;
 
 use openflux::actions;
-use openflux::config::{AppConfig, Profile, ProfileMode};
+use openflux::config::{AppConfig, Codec, Profile, ProfileMode, Transport};
 use openflux::engine;
 use openflux::paths::Paths;
 use openflux::{FWMARK, TUN_NAME};
@@ -57,7 +57,10 @@ fn ensure_root_path() {
 struct ProfileView {
     name: String,
     mode: String,
+    transport: String,
+    codec: String,
     doc_url: String,
+    doc_urls: Vec<String>,
     active: bool,
 }
 
@@ -80,6 +83,11 @@ struct StatusView {
     /// Tunnel problem read from the engine log (reason/detail pair, localized in the UI).
     issue_reason: Option<String>,
     issue_detail: Option<String>,
+    /// Persisted "verbose engine log" preference.
+    debug: bool,
+    /// "active" while packets move, "dropping" while the transport is down and everything
+    /// routed into the tunnel is being discarded. None until the engine logs a verdict.
+    tunnel_state: Option<String>,
 }
 
 fn to_rich<T>(result: Result<T, anyhow::Error>) -> Result<T, String> {
@@ -98,7 +106,10 @@ fn profiles(ctx: tauri::State<'_, Ctx>) -> Result<Vec<ProfileView>, String> {
                 ProfileMode::Manual => "manual".to_string(),
                 ProfileMode::Key => "key".to_string(),
             },
+            transport: p.transport.to_string(),
+            codec: p.codec.to_string(),
             doc_url: p.doc_url.clone(),
+            doc_urls: p.doc_urls.clone(),
             active: cfg.active_profile.as_deref() == Some(p.name.as_str()),
         })
         .collect())
@@ -120,12 +131,104 @@ fn status(ctx: tauri::State<'_, Ctx>) -> Result<StatusView, String> {
         proxy_system_mode: s.proxy_system_mode.clone(),
         issue_reason: s.issue.as_ref().map(|i| i.reason.clone()),
         issue_detail: s.issue.as_ref().map(|i| i.detail.clone()),
+        debug: actions::load(&ctx.paths).map(|c| c.debug).unwrap_or(false),
+        tunnel_state: engine::tunnel_state(&ctx.paths.engine_log).map(|s| s.as_str().to_string()),
     })
+}
+
+/// Persist the verbose-logging preference. It applies to the next engine spawn, so the
+/// engine must be restarted for it to take effect.
+/// The machine-wide settings: SOCKS5 port, TUN DNS and split tunneling. They describe the
+/// host rather than an account, so every profile uses them.
+#[derive(serde::Serialize)]
+struct Settings {
+    socks_port: u16,
+    dns: String,
+    split_mode: String,
+    split_domains: String,
+}
+
+#[tauri::command]
+fn settings(ctx: tauri::State<'_, Ctx>) -> Result<Settings, String> {
+    let cfg = to_rich(actions::load(&ctx.paths))?;
+    let split_mode = if cfg.split_enabled() {
+        cfg.split_mode.clone()
+    } else {
+        "none".to_string()
+    };
+    Ok(Settings {
+        socks_port: cfg.socks_port,
+        dns: cfg.dns.clone(),
+        split_mode,
+        split_domains: cfg.split_csv(),
+    })
+}
+
+#[tauri::command]
+fn settings_set(
+    ctx: tauri::State<'_, Ctx>,
+    socks_port: Option<u16>,
+    dns: Option<String>,
+    split_mode: Option<String>,
+    split_domains: Option<String>,
+) -> Result<String, String> {
+    let mut cfg = to_rich(actions::load(&ctx.paths))?;
+    if let Some(port) = socks_port {
+        cfg.socks_port = port;
+    }
+    if let Some(dns) = dns {
+        let dns = dns.trim().to_string();
+        if dns.is_empty() {
+            return Err("DNS must not be empty".to_string());
+        }
+        cfg.dns = dns;
+    }
+    if let Some(mode) = split_mode {
+        cfg.split_mode = if mode == "none" { String::new() } else { mode };
+        if cfg.split_mode.is_empty() {
+            cfg.split_sites.clear();
+        }
+    }
+    if let Some(domains) = split_domains {
+        cfg.split_sites = openflux::config::normalize_split_domains(&domains);
+    }
+    to_rich(cfg.validate())?;
+    if !cfg.split_enabled() {
+        cfg.split_sites.clear();
+    }
+    to_rich(actions::save(&ctx.paths, &cfg))?;
+    Ok(actions::settings_summary(&cfg))
+}
+
+#[tauri::command]
+fn set_debug(ctx: tauri::State<'_, Ctx>, enabled: bool) -> Result<bool, String> {
+    let mut cfg = to_rich(actions::load(&ctx.paths))?;
+    cfg.debug = enabled;
+    to_rich(actions::save(&ctx.paths, &cfg))?;
+    Ok(enabled)
 }
 
 #[tauri::command]
 fn set_active(ctx: tauri::State<'_, Ctx>, name: String) -> Result<String, String> {
     to_rich(actions::set_active(&ctx.paths, &name))
+}
+
+fn parse_transport_or_default(value: Option<&str>) -> Result<Transport, String> {
+    Ok(value
+        .map(|value| {
+            value
+                .parse::<Transport>()
+                .map_err(|error| error.to_string())
+        })
+        .transpose()?
+        .unwrap_or_default())
+}
+
+fn parse_codec_or_default(value: Option<&str>) -> Result<Codec, String> {
+    Ok(value
+        .map(|value| value.parse::<Codec>().map_err(|error| error.to_string()))
+        .transpose()?
+        .unwrap_or_default())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -134,16 +237,24 @@ fn add_profile(
     ctx: tauri::State<'_, Ctx>,
     name: String,
     mode: String,
+    transport: Option<String>,
+    codec: Option<String>,
+    doc_urls: Option<String>,
+    max_token: Option<String>,
+    max_uid: Option<String>,
     doc_url: Option<String>,
     control_url: Option<String>,
     key_token: Option<String>,
-    socks_port: Option<u16>,
     mtu: Option<u32>,
     streams: Option<u16>,
-    dns_upstream: Option<String>,
-    split_mode: Option<String>,
-    split_domains: Option<String>,
+    captcha_solve_mode: Option<String>,
 ) -> Result<String, String> {
+    let transport = parse_transport_or_default(transport.as_deref())?;
+    let codec = parse_codec_or_default(codec.as_deref())?;
+    let doc_urls = doc_urls
+        .as_deref()
+        .map(openflux::config::parse_doc_urls)
+        .unwrap_or_default();
     let mut cfg = to_rich(actions::load(&ctx.paths))?;
     if cfg.get(&name).is_some() {
         return Err(format!("profile '{name}' already exists"));
@@ -153,10 +264,16 @@ fn add_profile(
     }
     let mut profile = match mode.as_str() {
         "manual" => {
-            let url = doc_url.unwrap_or_default();
-            if url.trim().is_empty() {
-                return Err("doc URL is required for manual profiles".to_string());
-            }
+            let url = if transport == Transport::Oneme || transport == Transport::YandexMultistream
+            {
+                String::new()
+            } else {
+                let url = doc_url.unwrap_or_default();
+                if url.trim().is_empty() {
+                    return Err("doc URL is required for this transport".to_string());
+                }
+                url
+            };
             Profile::manual(&name, &url)
         }
         "key" => {
@@ -169,33 +286,32 @@ fn add_profile(
         }
         other => return Err(format!("unknown mode '{other}'")),
     };
-    if let Some(port) = socks_port {
-        profile.socks_port = port;
+    profile.transport = transport;
+    profile.codec = codec;
+    profile.doc_urls = doc_urls;
+    if let Some(value) = max_token {
+        profile.max_token = value;
+    }
+    if let Some(value) = max_uid {
+        profile.max_uid = value;
     }
     if let Some(m) = mtu {
         profile.mtu = m;
     }
     if let Some(s) = streams {
         profile.streams = s;
+    } else if transport == Transport::YandexMultistream && profile.doc_urls.len() >= 2 {
+        profile.streams = u16::try_from(profile.doc_urls.len()).unwrap_or(u16::MAX);
     }
-    if let Some(dns) = dns_upstream {
-        if !dns.trim().is_empty() {
-            profile.dns_upstream = dns.trim().to_string();
-        }
+    if let Some(mode) = captcha_solve_mode {
+        profile.captcha_solve_mode = openflux::config::normalize_captcha_mode(&mode);
     }
-    if let Some(mode) = split_mode {
-        profile.split_mode = if mode == "none" { String::new() } else { mode };
-    }
-    if let Some(domains) = split_domains {
-        profile.split_sites = domains
-            .split(',')
-            .map(|d| d.trim().trim_start_matches('.').to_string())
-            .filter(|d| !d.is_empty())
-            .collect();
-    }
+    let profile_transport = profile.transport;
     to_rich(cfg.add(profile))?;
     to_rich(actions::save(&ctx.paths, &cfg))?;
-    Ok(format!("profile '{name}' added"))
+    Ok(format!(
+        "profile '{name}' added (transport={profile_transport})"
+    ))
 }
 
 #[tauri::command]
@@ -217,20 +333,34 @@ fn mode_str(mode: &ProfileMode) -> &'static str {
 /// Mirrors the CLI `openflux import <link>`.
 #[tauri::command]
 fn import_link(ctx: tauri::State<'_, Ctx>, link: String) -> Result<String, String> {
-    let profile = to_rich(openflux::import::import_link(&link))?;
+    let imported = to_rich(openflux::import::import_link(&link))?;
+    let profile = imported.profile;
     let mut cfg = to_rich(actions::load(&ctx.paths))?;
     if cfg.get(&profile.name).is_some() {
         return Err(format!("profile '{}' already exists", profile.name));
     }
     to_rich(cfg.add(profile.clone()))?;
+    // A link may carry a DNS upstream; that is a machine-wide setting, so it is stored
+    // globally rather than on the profile.
+    let dns_note = match imported.dns.filter(|d| !d.trim().is_empty()) {
+        Some(dns) => {
+            cfg.dns = dns.trim().to_string();
+            Some(format!("\n  dns={}", cfg.dns))
+        }
+        None => None,
+    };
+    to_rich(cfg.validate())?;
     to_rich(actions::save(&ctx.paths, &cfg))?;
     Ok(format!(
-        "imported profile '{}' ({}):\n  control_url={}\n  doc_url={}\n  e2e={}",
+        "imported profile '{}' ({}):\n  control_url={}\n  transport={}\n  codec={}\n  doc_url={}\n  e2e={}{}",
         profile.name,
         mode_str(&profile.mode),
         profile.control_url,
+        profile.transport,
+        profile.codec,
         profile.doc_url,
-        profile.e2e_encryption
+        profile.e2e_encryption,
+        dns_note.as_deref().unwrap_or("")
     ))
 }
 
@@ -246,7 +376,14 @@ fn take_notice(ctx: tauri::State<'_, Ctx>) -> Option<String> {
 // async runtime while the window keeps painting.
 #[tauri::command]
 async fn connect(ctx: tauri::State<'_, Ctx>, name: Option<String>) -> Result<String, String> {
-    to_rich(actions::connect(&ctx.paths, &ctx.engine_bin, name.as_deref(), None)).map(|o| {
+    to_rich(actions::connect(
+        &ctx.paths,
+        &ctx.engine_bin,
+        name.as_deref(),
+        None,
+        false,
+    ))
+    .map(|o| {
         format!(
             "connected '{}' (pid {}), socks 127.0.0.1:{}\n  next: TUN (needs root) or `proxy on`",
             o.profile, o.pid, o.port
@@ -256,7 +393,43 @@ async fn connect(ctx: tauri::State<'_, Ctx>, name: Option<String>) -> Result<Str
 
 #[tauri::command]
 async fn disconnect(ctx: tauri::State<'_, Ctx>) -> Result<String, String> {
-    to_rich(actions::disconnect(&ctx.paths))
+    // A TUN engine runs as root, so an unprivileged SIGTERM to it is refused (EPERM) and the
+    // button would only print a warning while the tunnel kept holding the machine's routing.
+    // Hand the whole teardown to the privileged entry point, the same one the TUN toggle uses.
+    #[cfg(unix)]
+    let mut privileged = String::new();
+    #[cfg(unix)]
+    {
+        let st = to_rich(actions::status(&ctx.paths))?;
+        if st.tun_up {
+            let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+            let out = std::process::Command::new("pkexec")
+                .arg(&exe)
+                .args(["disconnect"])
+                .output()
+                .map_err(|e| format!("spawn pkexec: {e}"))?;
+            if !out.status.success() {
+                let text = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                return Err(if text.is_empty() {
+                    format!("pkexec exited with {}", out.status)
+                } else {
+                    text
+                });
+            }
+            privileged = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        }
+    }
+    // Keep the unprivileged pass even after the privileged one: under pkexec HOME points at
+    // root, so the system proxy and any pidfile of ours live in the *user's* state dir and
+    // only this pass can restore them. The engine itself is already gone by then, and
+    // `discover_running` finds nothing even if the privileged run used a different state dir.
+    let local = to_rich(actions::disconnect(&ctx.paths))?;
+    Ok(match (privileged.is_empty(), local.is_empty()) {
+        (true, true) => local,
+        (true, false) => local,
+        (false, true) => privileged,
+        (false, false) => format!("{privileged}\n{local}"),
+    })
 }
 
 #[tauri::command]
@@ -277,7 +450,7 @@ async fn proxy_toggle(ctx: tauri::State<'_, Ctx>) -> Result<String, String> {
 #[tauri::command]
 async fn tun_toggle(app: tauri::AppHandle) -> Result<String, String> {
     // Unix: delegate the privileged toggle to `pkexec <self> tun on|off` (root PATH fix
-    // in `headless_tun`). Windows: TUN is not implemented; degrade to an honest message
+    // in `headless_command`). Windows: TUN is not implemented; degrade to an honest message
     // until the Wintun integration lands.
     #[cfg(unix)]
     {
@@ -321,9 +494,15 @@ async fn tun_toggle(app: tauri::AppHandle) -> Result<String, String> {
         let sub = if st.tun_up { "off" } else { "on" };
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
         let params = format!("tun {sub}");
-        let mut exe_w: Vec<u16> = exe.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        let mut exe_w: Vec<u16> = exe
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
         let mut params_w: Vec<u16> = std::ffi::OsStr::new(&params)
-            .encode_wide().chain(std::iter::once(0)).collect();
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
         let mut verb: Vec<u16> = "runas".encode_utf16().chain(std::iter::once(0)).collect();
         let mut dir: Vec<u16> = vec![0];
         // SAFETY: all argument buffers are NUL-terminated wide strings; hwnd nil.
@@ -396,6 +575,9 @@ fn run_gui(ctx: Ctx) {
             disconnect,
             proxy_toggle,
             tun_toggle,
+            settings,
+            settings_set,
+            set_debug,
             log_tail
         ])
         .run(tauri::generate_context!())
@@ -441,10 +623,11 @@ pub fn headless_import(link: &str) -> String {
     if let Err(e) = paths.ensure_dirs() {
         return format!("openflux: {e:#}");
     }
-    let profile = match openflux::import::import_link(link) {
+    let imported = match openflux::import::import_link(link) {
         Ok(p) => p,
         Err(e) => return format!("openflux: {e:#}"),
     };
+    let profile = imported.profile;
     let mut cfg = match actions::load(&paths) {
         Ok(c) => c,
         Err(e) => return format!("openflux: {e:#}"),
@@ -455,22 +638,34 @@ pub fn headless_import(link: &str) -> String {
     if let Err(e) = cfg.add(profile.clone()) {
         return format!("openflux: {e:#}");
     }
+    if let Some(dns) = imported.dns.filter(|d| !d.trim().is_empty()) {
+        cfg.dns = dns.trim().to_string();
+    }
+    if let Err(e) = cfg.validate() {
+        return format!("openflux: {e:#}");
+    }
     if let Err(e) = actions::save(&paths, &cfg) {
         return format!("openflux: {e:#}");
     }
     format!(
-        "imported profile '{}' ({}):\n  control_url={}\n  doc_url={}\n  e2e={}\n  active: {}",
+        "imported profile '{}' ({}):\n  control_url={}\n  transport={}\n  codec={}\n  doc_url={}\n  e2e={}\n  active: {}\n  settings: {}",
         profile.name,
         mode_str(&profile.mode),
         profile.control_url,
+        profile.transport,
+        profile.codec,
         profile.doc_url,
         profile.e2e_encryption,
-        cfg.active_profile.as_deref().unwrap_or("<none>")
+        cfg.active_profile.as_deref().unwrap_or("<none>"),
+        actions::settings_summary(&cfg)
     )
 }
 
-/// Headless privileged path: `openflux-gui tun on|off` invoked by the GUI through pkexec.
-pub fn headless_tun() -> i32 {
+/// Headless privileged path: `openflux-gui tun on|off` / `openflux-gui disconnect` invoked by
+/// the GUI through pkexec. The Disconnect button needs it because a TUN engine runs as root,
+/// and an unprivileged SIGTERM to it is refused - the button would report a warning while the
+/// tunnel kept holding the machine's routing.
+pub fn headless_command() -> i32 {
     #[cfg(unix)]
     if nix::unistd::geteuid().is_root() {
         ensure_root_path();
@@ -488,9 +683,27 @@ pub fn headless_tun() -> i32 {
     }
     let engine_bin = resolve_engine();
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.first().map(String::as_str) != Some("tun") {
-        eprintln!("openflux: headless mode expects `tun on` / `tun off`");
-        return 2;
+    match args.first().map(String::as_str) {
+        Some("tun") => {}
+        Some("disconnect") => {
+            // Full teardown as root: routing, system proxy and the engine itself.
+            return match actions::disconnect(&paths) {
+                Ok(text) => {
+                    if !text.is_empty() {
+                        println!("{text}");
+                    }
+                    0
+                }
+                Err(e) => {
+                    eprintln!("openflux: {e:#}");
+                    1
+                }
+            };
+        }
+        _ => {
+            eprintln!("openflux: headless mode expects `tun on` / `tun off` / `disconnect`");
+            return 2;
+        }
     }
     match args.get(1).map(String::as_str) {
         Some("on") => {
@@ -510,12 +723,18 @@ pub fn headless_tun() -> i32 {
             }
         }
         Some("off") => match actions::tun_down(&paths) {
-            Ok(true) => {
-                println!("TUN mode down");
-                0
-            }
-            Ok(false) => {
-                println!("TUN already down");
+            Ok(down) => {
+                if down.was_up {
+                    println!("TUN mode down");
+                } else {
+                    println!("TUN already down");
+                }
+                if let Some(pid) = down.engine_stopped {
+                    println!("engine stopped (was pid {pid})");
+                }
+                if let Some(w) = down.engine_warning {
+                    println!("warning: {w}");
+                }
                 0
             }
             Err(e) => {
@@ -527,5 +746,55 @@ pub fn headless_tun() -> i32 {
             eprintln!("openflux: unknown tun subcommand {other:?}");
             2
         }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transport_parsing_covers_every_known_value() {
+        for transport in Transport::ALL {
+            assert_eq!(
+                parse_transport_or_default(Some(transport.as_str())).unwrap(),
+                *transport
+            );
+        }
+        assert_eq!(parse_transport_or_default(None).unwrap(), Transport::Yandex);
+        assert!(parse_transport_or_default(Some("carrier-pigeon")).is_err());
+    }
+
+    #[test]
+    fn codec_parsing_defaults_to_legacy() {
+        assert_eq!(parse_codec_or_default(None).unwrap(), Codec::Legacy);
+        assert_eq!(
+            parse_codec_or_default(Some("batched")).unwrap(),
+            Codec::Batched
+        );
+        assert!(parse_codec_or_default(Some("zstd")).is_err());
+    }
+
+    #[test]
+    fn doc_url_and_split_lists_use_the_shared_normalisation() {
+        assert_eq!(
+            openflux::config::parse_doc_urls(" https://a , ,https://b "),
+            vec!["https://a".to_string(), "https://b".to_string()]
+        );
+        assert_eq!(
+            openflux::config::normalize_split_domains("*.ya.ru, .yandex.ru"),
+            vec!["*.ya.ru".to_string(), "yandex.ru".to_string()]
+        );
+    }
+
+    #[test]
+    fn captcha_mode_from_the_form_is_normalised_before_storage() {
+        let mode = openflux::config::normalize_captcha_mode;
+        assert_eq!(mode("off"), "");
+        assert_eq!(mode(" headless_browser "), "headless_browser");
+
+        let mut profile = Profile::manual("gui", "https://disk.yandex.ru/i/a");
+        profile.transport = Transport::Mailru;
+        profile.captcha_solve_mode = mode("headless_browser");
+        assert!(profile.validate().is_err(), "mail.ru has no captcha solver");
     }
 }

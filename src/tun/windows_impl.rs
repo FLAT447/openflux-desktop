@@ -13,7 +13,7 @@ use std::os::windows::ffi::OsStrExt;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use windows_sys::Win32::Foundation::{FreeLibrary, HMODULE, SetHandleInformation};
+use windows_sys::Win32::Foundation::{FreeLibrary, SetHandleInformation, HMODULE};
 use windows_sys::Win32::Security::{
     GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
 };
@@ -54,7 +54,10 @@ struct Wintun {
 }
 
 fn wide(s: &str) -> Vec<u16> {
-    std::ffi::OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
+    std::ffi::OsStr::new(s)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
 }
 
 fn get_proc_raw(lib: HMODULE, name: &str) -> Result<usize> {
@@ -135,7 +138,10 @@ pub fn require_root() -> Result<()> {
 }
 
 fn run(prog: &str, args: &[&str]) -> Result<String> {
-    let out = Command::new(prog).args(args).output().with_context(|| format!("run {prog}"))?;
+    let out = Command::new(prog)
+        .args(args)
+        .output()
+        .with_context(|| format!("run {prog}"))?;
     if !out.status.success() {
         bail!(
             "`{prog} {}` failed: {}",
@@ -179,8 +185,16 @@ fn add_policy_routing(iface: &str, addr: &str, mtu: u32) -> Result<()> {
     run(
         "netsh",
         &[
-            "interface", "ipv4", "set", "address", "interface", iface, "source=static",
-            &format!("address={ip}"), &format!("mask={mask}"), "gateway=none",
+            "interface",
+            "ipv4",
+            "set",
+            "address",
+            "interface",
+            iface,
+            "source=static",
+            &format!("address={ip}"),
+            &format!("mask={mask}"),
+            "gateway=none",
         ],
     )
     .context("set adapter address")?;
@@ -188,17 +202,21 @@ fn add_policy_routing(iface: &str, addr: &str, mtu: u32) -> Result<()> {
     run(
         "netsh",
         &[
-            "interface", "ipv4", "set", "subinterface", iface, "mtu",
-            &mtu.clamp(576, 1400).to_string(), "store=persistent",
+            "interface",
+            "ipv4",
+            "set",
+            "subinterface",
+            iface,
+            "mtu",
+            &mtu.clamp(576, 1400).to_string(),
+            "store=persistent",
         ],
     )
     .context("set adapter MTU")?;
     for route in ["0.0.0.0/1", "128.0.0.0/1"] {
         run(
             "netsh",
-            &[
-                "interface", "ipv4", "add", "route", route, iface, &ip,
-            ],
+            &["interface", "ipv4", "add", "route", route, iface, &ip],
         )
         .with_context(|| format!("add route {route}"))?;
     }
@@ -208,7 +226,10 @@ fn add_policy_routing(iface: &str, addr: &str, mtu: u32) -> Result<()> {
 fn del_policy_routing(iface: &str) {
     // Best effort: teardown must not fail because the routes are already half-gone.
     for route in ["0.0.0.0/1", "128.0.0.0/1"] {
-        run_ok("netsh", &["interface", "ipv4", "delete", "route", route, iface]);
+        run_ok(
+            "netsh",
+            &["interface", "ipv4", "delete", "route", route, iface],
+        );
     }
 }
 
@@ -217,7 +238,9 @@ pub fn on(cfg: &super::TunConfig) -> Result<i32> {
     require_root()?;
 
     if let Some(pid) = state::read_pid(&cfg.engine_pid) {
-        if state::is_alive(pid) && state::pid_meta(&cfg.engine_pid, "mode").as_deref() == Some("tun") {
+        if state::is_alive(pid)
+            && state::pid_meta(&cfg.engine_pid, "mode").as_deref() == Some("tun")
+        {
             return Ok(pid); // already up
         }
     }
@@ -255,9 +278,7 @@ pub fn on(cfg: &super::TunConfig) -> Result<i32> {
     // process receives the same handle value. Without this the child would inherit a
     // stale number and its socket traffic would go nowhere.
     // SAFETY: session is a live handle we own.
-    if unsafe {
-        SetHandleInformation(session, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT)
-    } == 0 {
+    if unsafe { SetHandleInformation(session, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) } == 0 {
         let err = last_error();
         // SAFETY: undo the session we did start.
         unsafe {
@@ -293,10 +314,9 @@ pub fn on(cfg: &super::TunConfig) -> Result<i32> {
     cmd.arg("--tun-read")
         .arg(&handle)
         .arg("--tun-write")
-        .arg(&handle)
-        .arg("--url")
-        .arg(&cfg.url)
-        .arg("--dns")
+        .arg(&handle);
+    cfg.transport.apply(&mut cmd);
+    cmd.arg("--dns")
         .arg(&cfg.dns)
         .arg("--mtu")
         .arg(cfg.mtu.to_string());
@@ -324,7 +344,8 @@ pub fn on(cfg: &super::TunConfig) -> Result<i32> {
     if cfg.debug {
         cmd.arg("--debug");
     }
-    cmd.stdout(Stdio::from(log.try_clone().context("clone engine log")?))
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::from(log.try_clone().context("clone engine log")?))
         .stderr(Stdio::from(log));
 
     let child = match cmd.spawn() {
@@ -354,7 +375,10 @@ pub fn on(cfg: &super::TunConfig) -> Result<i32> {
         }
         del_policy_routing(WINTUN_INSTANCE_NAME);
         state::remove_pid(&cfg.engine_pid);
-        bail!("engine exited during TUN startup; see {}", cfg.engine_log.display());
+        bail!(
+            "engine exited during TUN startup; see {}",
+            cfg.engine_log.display()
+        );
     }
     state::write_pid(&cfg.engine_pid, pid, Some("mode=tun".into()))?;
 
@@ -372,7 +396,9 @@ pub fn on(cfg: &super::TunConfig) -> Result<i32> {
 /// Wintun driver observes as the session ending) and drop the /1 routes.
 pub fn off(cfg: &super::TunConfig) -> Result<()> {
     if let Some(pid) = state::read_pid(&cfg.engine_pid) {
-        if state::is_alive(pid) && state::pid_meta(&cfg.engine_pid, "mode").as_deref() == Some("tun") {
+        if state::is_alive(pid)
+            && state::pid_meta(&cfg.engine_pid, "mode").as_deref() == Some("tun")
+        {
             match state::terminate(pid, Duration::from_secs(5)) {
                 Ok(()) => state::remove_pid(&cfg.engine_pid),
                 Err(e) => {

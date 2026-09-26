@@ -31,7 +31,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.22"
+          go-version: "1.26.4"
 
       - name: Lint (clippy -D warnings + go vet)
         run: make lint
@@ -49,7 +49,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.22"
+          go-version: "1.26.4"
 
       - name: Build CLI + GUI (debug)
         shell: bash
@@ -78,7 +78,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.22"
+          go-version: "1.26.4"
 
       - name: Build release bundle
         run: make dist GUI=1 VERSION=${GITHUB_REF_NAME#v}
@@ -103,7 +103,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.22"
+          go-version: "1.26.4"
 
       - name: Build CLI + GUI
         shell: bash

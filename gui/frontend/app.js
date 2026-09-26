@@ -8,6 +8,10 @@ const I18N = {
     profiles: "Profiles",
     status: "Status",
     engineLog: "Engine log",
+    verboseLog: "Verbose engine log (applies after reconnect)",
+    statusTunnel: "tunnel",
+    tunnelActive: "carrying traffic",
+    tunnelDropping: "provider is down - traffic is being dropped until it reconnects",
     btnConnect: "Connect",
     btnDisconnect: "Disconnect",
     busy: "working…",
@@ -40,10 +44,18 @@ const I18N = {
     fMode: "Mode",
     fManual: "Manual (doc URL)",
     fKey: "Key (controlplane)",
-    fDocUrl: "Yandex Docs URL",
+    fTransport: "Transport",
+    fCodec: "Codec",
+    fDocUrls: "Document URLs (comma-separated)",
+    fMaxToken: "OneMe MAX token",
+    fMaxUid: "OneMe target user ID",
+    fDocUrl: "Document URL",
     fControlUrl: "Controlplane base URL",
     fKeyToken: "Key token",
-    fPort: "SOCKS5 port (default 1080)",
+    settingsTitle: "Global settings",
+    settingsHint: "These apply to every profile: they describe this machine, not the account.",
+    profileGlobalHint: "SOCKS5 port, DNS and split tunneling are global - see Settings.",
+    setPort: "SOCKS5 port",
     fStreams: "Streams (multistream, 1-8)",
     fDns: "DNS upstream for TUN (plain ip / tls://host / https://host/path)",
     fSplitMode: "TUN split mode",
@@ -51,6 +63,9 @@ const I18N = {
     fSplitExclude: "Exclude (list bypasses the tunnel)",
     fSplitInclude: "Include (only list uses it)",
     fSplitDomains: "Split domains (comma-separated, *.ya.ru)",
+    fCaptcha: "Yandex bot check",
+    fCaptchaOff: "Off (engine reports the block)",
+    fCaptchaHeadless: "Solve in headless browser (needs Chrome/Chromium)",
     btnSave: "Save",
     btnCancel: "Cancel",
     delConfirm: "Delete profile '%s'?",
@@ -63,6 +78,10 @@ const I18N = {
     profiles: "Профили",
     status: "Состояние",
     engineLog: "Журнал движка",
+    verboseLog: "Подробный журнал движка (применится после переподключения)",
+    statusTunnel: "туннель",
+    tunnelActive: "трафик идёт",
+    tunnelDropping: "провайдер недоступен — трафик сбрасывается до переподключения",
     btnConnect: "Подключить",
     btnDisconnect: "Отключить",
     busy: "работаю…",
@@ -95,10 +114,18 @@ const I18N = {
     fMode: "Режим",
     fManual: "Ручной (URL документа)",
     fKey: "Ключ (контролплейн)",
-    fDocUrl: "URL Яндекс.Документов",
+    fTransport: "Транспорт",
+    fCodec: "Кодек",
+    fDocUrls: "URL документов (через запятую)",
+    fMaxToken: "MAX-токен OneMe",
+    fMaxUid: "ID пользователя OneMe",
+    fDocUrl: "URL документа",
     fControlUrl: "Базовый URL контролплейна",
     fKeyToken: "Ключевой токен",
-    fPort: "SOCKS5-порт (по умолч. 1080)",
+    settingsTitle: "Общие настройки",
+    settingsHint: "Действуют для всех профилей: это настройки машины, а не аккаунта.",
+    profileGlobalHint: "SOCKS5-порт, DNS и раздельный туннель — общие настройки, см. «Настройки».",
+    setPort: "SOCKS5-порт",
     fStreams: "Потоки (multistream, 1-8)",
     fDns: "DNS для TUN (ip / tls://host / https://host/path)",
     fSplitMode: "Режим разделения (TUN)",
@@ -106,6 +133,9 @@ const I18N = {
     fSplitExclude: "Исключить (список в обход тунелля)",
     fSplitInclude: "Только список ходит в туннель",
     fSplitDomains: "Домены для разделения (через запятую, *.ya.ru)",
+    fCaptcha: "Проверка Яндекса (капча)",
+    fCaptchaOff: "Выкл (движок только сообщит о блокировке)",
+    fCaptchaHeadless: "Решать в headless-браузере (нужен Chrome/Chromium)",
     btnSave: "Сохранить",
     btnCancel: "Отмена",
     delConfirm: "Удалить профиль '%s'?",
@@ -139,6 +169,7 @@ const profileList = document.getElementById("profile-list");
 const statusRows = document.getElementById("status-rows");
 const messageEl = document.getElementById("message");
 const logView = document.getElementById("log-view");
+const fDebug = document.getElementById("f-debug");
 const modal = document.getElementById("modal");
 const importModal = document.getElementById("modal-import");
 const btnAdd = document.getElementById("btn-add");
@@ -146,15 +177,25 @@ const btnImportBtn = document.getElementById("btn-import");
 const fLink = document.getElementById("f-link");
 const fName = document.getElementById("f-name");
 const fMode = document.getElementById("f-mode");
+const fTransport = document.getElementById("f-transport");
+const fCodec = document.getElementById("f-codec");
+const fDocUrls = document.getElementById("f-doc-urls");
+const fMaxToken = document.getElementById("f-max-token");
+const fMaxUid = document.getElementById("f-max-uid");
 const fDocUrl = document.getElementById("f-doc-url");
 const fControlUrl = document.getElementById("f-control-url");
 const fKeyToken = document.getElementById("f-key-token");
-const fPort = document.getElementById("f-port");
 const fStreams = document.getElementById("f-streams");
-const fDns = document.getElementById("f-dns");
-const fSplitMode = document.getElementById("f-split-mode");
-const fSplitDomains = document.getElementById("f-split-domains");
+const btnSettings = document.getElementById("btn-settings");
+const modalSettings = document.getElementById("modal-settings");
+const sPort = document.getElementById("s-port");
+const sDns = document.getElementById("s-dns");
+const sSplitMode = document.getElementById("s-split-mode");
+const sSplitDomains = document.getElementById("s-split-domains");
+const fCaptchaSolveMode = document.getElementById("f-captcha-solve-mode");
 const fManualRow = document.getElementById("f-manual-row");
+const fDocUrlsRow = document.getElementById("f-doc-urls-row");
+const fOnemeRow = document.getElementById("f-oneme-row");
 const fKeyRow = document.getElementById("f-key-row");
 
 let selectedProfile = null;
@@ -222,11 +263,12 @@ async function renderProfiles() {
   for (const p of ps) {
     const li = document.createElement("li");
     li.className = p.active ? "active" : "";
+    li.title = p.doc_urls?.length ? p.doc_urls.join(", ") : (p.doc_url || "");
     const name = document.createElement("span");
     name.textContent = p.name + (p.active ? " ✓" : "");
     const mode = document.createElement("span");
     mode.className = "mode";
-    mode.textContent = p.mode;
+    mode.textContent = `${p.mode} · ${p.transport}`;
     li.append(name, mode);
     const del = document.createElement("button");
     del.className = "del";
@@ -272,6 +314,11 @@ async function renderStatus() {
           : t("proxyOff"),
         "warn"
       );
+  const tunnel = s.tunnel_state
+    ? s.tunnel_state === "active"
+      ? pill(t("tunnelActive"), "ok")
+      : pill(t("tunnelDropping"), "err")
+    : null;
   const detail = s.issue_detail ?? "";
   const issue = s.issue_reason
     ? pill(
@@ -283,11 +330,13 @@ async function renderStatus() {
         "err"
       )
     : null;
+  fDebug.checked = s.debug === true;
   statusRows.innerHTML = `
     <div class="row"><span class="k">${t("statusProfile")}</span><span>${escapeHtml(s.active_profile ?? "<none>")}</span></div>
     <div class="row"><span class="k">${t("statusEngine")}</span>${engine}</div>
     <div class="row"><span class="k">${t("statusTun")}</span>${tun}</div>
     <div class="row"><span class="k">${t("statusProxy")}</span>${proxy}</div>
+    ${tunnel ? `<div class="row"><span class="k">${t("statusTunnel")}</span>${tunnel}</div>` : ""}
     ${issue ? `<div class="row"><span class="k">${t("statusIssue")}</span>${issue}</div>` : ""}`;
   renderStatic();
 }
@@ -312,19 +361,31 @@ async function refresh() {
   await Promise.all([renderProfiles(), renderStatus(), renderLog()]);
 }
 
+function updateTransportFields() {
+  const manual = fMode.value === "manual";
+  const transport = fTransport.value;
+  const multi = transport === "yandex_multistream";
+  const oneme = transport === "oneme";
+  fManualRow.classList.toggle("hidden", !manual || multi || oneme);
+  fDocUrlsRow.classList.toggle("hidden", !multi);
+  fOnemeRow.classList.toggle("hidden", !oneme);
+  fKeyRow.classList.toggle("hidden", manual);
+}
+
 function openAddModal() {
   fName.value = "";
+  fTransport.value = "yandex";
+  fCodec.value = "legacy";
   fDocUrl.value = "";
+  fDocUrls.value = "";
+  fMaxToken.value = "";
+  fMaxUid.value = "";
   fControlUrl.value = "";
   fKeyToken.value = "";
-  fPort.value = "";
   fStreams.value = "";
-  fDns.value = "";
-  fSplitMode.value = "none";
-  fSplitDomains.value = "";
+  fCaptchaSolveMode.value = "off";
   fMode.value = "manual";
-  fManualRow.classList.remove("hidden");
-  fKeyRow.classList.add("hidden");
+  updateTransportFields();
   modal.classList.remove("hidden");
   fName.focus();
 }
@@ -335,17 +396,20 @@ function closeAddModal() {
 
 async function saveProfile() {
   const mode = fMode.value;
+  const transport = fTransport.value;
   const args = {
     name: fName.value.trim(),
     mode,
-    docUrl: mode === "manual" ? fDocUrl.value.trim() || null : null,
+    transport,
+    codec: fCodec.value,
+    docUrl: mode === "manual" && transport !== "oneme" && transport !== "yandex_multistream" ? fDocUrl.value.trim() || null : null,
+    docUrls: transport === "yandex_multistream" ? fDocUrls.value.trim() || null : null,
+    maxToken: transport === "oneme" ? fMaxToken.value.trim() || null : null,
+    maxUid: transport === "oneme" ? fMaxUid.value.trim() || null : null,
     controlUrl: mode === "key" ? fControlUrl.value.trim() || null : null,
     keyToken: mode === "key" ? fKeyToken.value.trim() || null : null,
-    socksPort: fPort.value ? Number(fPort.value) : null,
     streams: fStreams.value ? Number(fStreams.value) : null,
-    dnsUpstream: fDns.value.trim() || null,
-    splitMode: fSplitMode.value === "none" ? "none" : fSplitMode.value,
-    splitDomains: fSplitDomains.value.trim() || null,
+    captchaSolveMode: fCaptchaSolveMode.value,
   };
   try {
     const msg = await invoke("add_profile", args);
@@ -357,14 +421,21 @@ async function saveProfile() {
   await refresh();
 }
 
+fDebug.onchange = async () => {
+  try {
+    await invoke("set_debug", { enabled: fDebug.checked });
+    setMessage(t("verboseLog"), "ok");
+  } catch (e) {
+    fDebug.checked = !fDebug.checked;
+    setMessage(String(e), "error");
+  }
+};
+
 btnAdd.onclick = openAddModal;
 document.getElementById("btn-modal-cancel").onclick = closeAddModal;
 document.getElementById("btn-modal-save").onclick = saveProfile;
-fMode.onchange = () => {
-  const key = fMode.value === "key";
-  fManualRow.classList.toggle("hidden", key);
-  fKeyRow.classList.toggle("hidden", !key);
-};
+fMode.onchange = updateTransportFields;
+fTransport.onchange = updateTransportFields;
 modal.onclick = (e) => {
   if (e.target === modal) closeAddModal();
 };
@@ -414,6 +485,51 @@ btnConnect.onclick = () => {
     run("connect", () => invoke("connect", { name: selectedProfile }));
   }
 };
+// Global settings: the SOCKS5 port, the TUN DNS upstream and split tunneling describe this
+// machine, so they live next to the header instead of inside every profile.
+async function openSettings() {
+  try {
+    const s = await invoke("settings");
+    sPort.value = String(s.socks_port);
+    sDns.value = s.dns;
+    sSplitMode.value = s.split_mode;
+    sSplitDomains.value = s.split_domains;
+  } catch (e) {
+    setMessage(String(e), "error");
+    return;
+  }
+  modalSettings.classList.remove("hidden");
+  sPort.focus();
+}
+
+async function saveSettings() {
+  try {
+    const msg = await invoke("settings_set", {
+      socksPort: sPort.value ? Number(sPort.value) : null,
+      dns: sDns.value.trim() || null,
+      splitMode: sSplitMode.value,
+      splitDomains: sSplitDomains.value.trim() || null,
+    });
+    modalSettings.classList.add("hidden");
+    setMessage(msg, "ok");
+  } catch (e) {
+    setMessage(String(e), "error");
+  }
+  await refresh();
+}
+
+btnSettings.onclick = () => {
+  if (pending) return;
+  openSettings();
+};
+document.getElementById("btn-settings-save").onclick = () => {
+  if (pending) return;
+  saveSettings();
+};
+document.getElementById("btn-settings-cancel").onclick = () => {
+  modalSettings.classList.add("hidden");
+};
+
 btnTun.onclick = () => {
   if (pending) return;
   run("toggle tun", () => invoke("tun_toggle"));

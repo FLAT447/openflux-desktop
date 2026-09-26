@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::config::{AppConfig, Profile, ProfileMode};
-use crate::engine::{self, EngineConfig};
+use crate::engine::{self, EngineConfig, TransportConfig};
 use crate::paths::Paths;
 use crate::proxy::{self, Backend};
 use crate::resolve;
@@ -34,6 +34,25 @@ pub struct TunUp {
 pub struct ExitUp {
     pub pid: i32,
     pub streams: u16,
+}
+
+/// One-line summary of the machine-wide settings (SOCKS5 port, TUN DNS, split tunneling).
+/// Shared by the CLI, the TUI and the GUI so all three describe the same knobs identically.
+pub fn settings_summary(cfg: &AppConfig) -> String {
+    let split = if cfg.split_enabled() {
+        cfg.split_mode.as_str()
+    } else {
+        "none"
+    };
+    let sites = if cfg.split_sites.is_empty() {
+        String::new()
+    } else {
+        format!(" [{}]", cfg.split_csv())
+    };
+    format!(
+        "socks_port={} dns={} split={split}{sites}",
+        cfg.socks_port, cfg.dns
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -95,7 +114,7 @@ pub fn set_active(paths: &Paths, name: &str) -> Result<String> {
 fn tun_shell(paths: &Paths) -> TunConfig {
     TunConfig {
         engine_bin: PathBuf::new(),
-        url: String::new(),
+        transport: TransportConfig::default(),
         token: None,
         tun_name: TUN_NAME.to_string(),
         tun_addr: String::new(),
@@ -135,36 +154,49 @@ pub fn connect(
     engine_bin: &Path,
     name: Option<&str>,
     socks_port: Option<u16>,
+    debug: bool,
 ) -> Result<ConnectOutcome> {
     let mut profile = pick_profile(paths, name)?;
 
-    if profile.mode == ProfileMode::Key && profile.doc_url.is_empty() {
+    if profile.mode == ProfileMode::Key && !profile.is_connectable() {
         if profile.control_url.is_empty() || profile.key_token.is_empty() {
-            bail!("profile '{}' is missing control_url/key_token", profile.name);
+            bail!(
+                "profile '{}' is missing control_url/key_token",
+                profile.name
+            );
         }
         let result = resolve::resolve_key(&profile.control_url, &profile.key_token)?;
         profile.doc_url = result.doc_url;
         profile.doc_urls = result.doc_urls;
+        profile.transport = result.transport;
         profile.e2e_encryption = result.e2e_encryption;
+        if profile.transport == crate::config::Transport::YandexMultistream
+            && profile.doc_urls.len() >= 2
+        {
+            profile.streams = u16::try_from(profile.doc_urls.len()).unwrap_or(u16::MAX);
+        }
         // Persist the resolution so `status` and later runs see a wired profile.
         let mut cfg = load(paths)?;
         if let Some(p) = cfg.get_mut(&profile.name) {
             p.doc_url = profile.doc_url.clone();
             p.doc_urls = profile.doc_urls.clone();
+            p.transport = profile.transport;
+            p.streams = profile.streams;
             p.e2e_encryption = profile.e2e_encryption;
         }
         save(paths, &cfg)?;
     }
 
+    profile.validate()?;
     if !profile.is_connectable() {
         bail!(
-            "profile '{}' has no doc_url; run `openflux check-key {}`",
+            "profile '{}' is not ready; run `openflux check-key {}`",
             profile.name,
             profile.name
         );
     }
 
-    let port = socks_port.unwrap_or(profile.socks_port);
+    let port = socks_port.unwrap_or(load(paths)?.socks_port);
     if tun::is_up(&tun_shell(paths)) {
         bail!("TUN mode is active; stop it with `pkexec openflux tun off` (or t in the TUI) before using `connect`");
     }
@@ -182,14 +214,15 @@ pub fn connect(
         std::thread::sleep(Duration::from_millis(200));
     }
 
+    let app_cfg = load(paths)?;
     let cfg = EngineConfig {
         bin: engine_bin.to_path_buf(),
-        url: profile.doc_url.clone(),
+        transport: TransportConfig::from_profile(&profile),
         socks_port: port,
         token: token_for(&profile),
         mtu: Some(profile.mtu),
         streams: profile.streams,
-        debug: false,
+        debug: debug || app_cfg.debug || env_debug(),
         log_file: paths.engine_log.clone(),
     };
     let pid = engine::start(&cfg, READY_TIMEOUT)?;
@@ -224,16 +257,20 @@ pub fn disconnect(paths: &Paths) -> Result<String> {
         }
     }
 
-    match engine::current(&paths.engine_pid) {
-        Some(pid) => match state::terminate(pid, READY_TIMEOUT) {
+    // Prefer a /proc-discovered engine over the pidfile: a live engine whose pidfile is
+    // missing (TUN spawns it from a root helper) used to skip this branch entirely, so the
+    // button reported "engine not running" while the tunnel was still holding the routing.
+    match engine::discover_running(&paths.engine_pid) {
+        Some(run) => match state::terminate(run.pid, READY_TIMEOUT) {
             Ok(()) => {
                 state::remove_pid(&paths.engine_pid);
-                lines.push(format!("engine stopped (was pid {pid})"));
+                lines.push(format!("engine stopped (was pid {})", run.pid));
             }
             // Typical when the engine holds TUN as root and we are unprivileged; the
             // routing is already down, but the engine itself needs the root teardown.
             Err(e) => lines.push(format!(
-                "warning: engine pid {pid} could not be stopped ({e:#}); it may be running as root - use `pkexec openflux tun off`"
+                "warning: engine pid {} could not be stopped ({e:#}); it may be running as root - use `pkexec openflux tun off`",
+                run.pid
             )),
         },
         None => lines.push("engine not running".to_string()),
@@ -242,18 +279,23 @@ pub fn disconnect(paths: &Paths) -> Result<String> {
     Ok(lines.join("\n"))
 }
 
+/// OPENFLUX_DEBUG=1 turns on verbose engine logging for a single run, without touching
+/// the persisted `debug` setting in openflux.toml.
+fn env_debug() -> bool {
+    std::env::var_os("OPENFLUX_DEBUG").is_some()
+}
+
 /// Bring TUN mode up for a profile (must run as root). Stops a SOCKS engine first since
 /// both modes share the engine pidfile.
 pub fn tun_up(paths: &Paths, engine_bin: &Path, name: Option<&str>, debug: bool) -> Result<TunUp> {
     let profile = pick_profile(paths, name)?;
-    if profile.mode == ProfileMode::Key && profile.doc_url.is_empty() {
+    profile.validate()?;
+    if !profile.is_connectable() {
         bail!(
-            "profile '{}' has no doc_url; run `openflux check-key` first",
+            "profile '{}' is not ready; run `openflux check-key {}` first",
+            profile.name,
             profile.name
         );
-    }
-    if !profile.is_connectable() {
-        bail!("profile '{}' has no doc_url", profile.name);
     }
 
     if engine::current(&paths.engine_pid).is_some()
@@ -262,42 +304,85 @@ pub fn tun_up(paths: &Paths, engine_bin: &Path, name: Option<&str>, debug: bool)
         engine::stop(&paths.engine_pid, READY_TIMEOUT)?;
     }
 
+    let app_cfg = load(paths)?;
     let cfg = TunConfig {
         engine_bin: engine_bin.to_path_buf(),
-        url: profile.doc_url.clone(),
+        transport: TransportConfig::from_profile(&profile),
         token: token_for(&profile),
         tun_name: TUN_NAME.to_string(),
         tun_addr: "10.0.0.1/24".to_string(),
         mtu: profile.mtu,
-        dns: profile.dns_upstream.clone(),
+        dns: app_cfg.dns.clone(),
         streams: profile.streams,
-        split_mode: profile.split_mode.clone(),
-        split_sites: profile.split_sites.clone(),
-        debug,
+        split_mode: app_cfg.split_mode.clone(),
+        split_sites: app_cfg.split_sites.clone(),
+        debug: debug || app_cfg.debug || env_debug(),
         engine_log: paths.engine_log.clone(),
         engine_pid: paths.engine_pid.clone(),
     };
     let pid = tun::on(&cfg)?;
     Ok(TunUp {
         pid,
-        dns: profile.dns_upstream,
+        dns: app_cfg.dns,
     })
 }
 
 /// Tear TUN mode down. Returns whether it had been up.
-pub fn tun_down(paths: &Paths) -> Result<bool> {
+/// What a TUN teardown achieved. Routing comes down first and unconditionally; the engine is
+/// stopped as well whenever we are allowed to signal it, and the failure is reported instead
+/// of hidden - "TUN off" that leaves a root engine holding the device is the state this whole
+/// function exists to avoid.
+pub struct TunDown {
+    pub was_up: bool,
+    pub engine_stopped: Option<i32>,
+    pub engine_warning: Option<String>,
+}
+
+pub fn tun_down(paths: &Paths) -> Result<TunDown> {
     let was_up = tun::is_up(&tun_shell(paths));
     tun::off(&tun_shell(paths))?;
-    Ok(was_up)
+    let mut out = TunDown {
+        was_up,
+        engine_stopped: None,
+        engine_warning: None,
+    };
+    // Only touch a TUN-mode engine: a SOCKS engine on the same port must survive a TUN toggle.
+    let running = engine::discover_running(&paths.engine_pid).filter(|r| r.mode == "tun");
+    if let Some(run) = running {
+        match state::terminate(run.pid, READY_TIMEOUT) {
+            Ok(()) => {
+                state::remove_pid(&paths.engine_pid);
+                out.engine_stopped = Some(run.pid);
+            }
+            Err(e) if was_up => {
+                out.engine_warning = Some(format!(
+                    "engine pid {} still holds the device ({e:#}); it runs as root - use `pkexec openflux tun off`",
+                    run.pid
+                ));
+            }
+            Err(_) => {}
+        }
+    }
+    Ok(out)
 }
 
 /// Start the engine as an exit node for a profile. A SOCKS/TUN engine (which would clash
 /// on the shared pidfile) is stopped first, mirroring `tun_up`. There is no local listener,
 /// so readiness is the engine's first established tunnel.
-pub fn exit_up(paths: &Paths, engine_bin: &Path, name: Option<&str>, debug: bool) -> Result<ExitUp> {
+pub fn exit_up(
+    paths: &Paths,
+    engine_bin: &Path,
+    name: Option<&str>,
+    debug: bool,
+) -> Result<ExitUp> {
     let profile = pick_profile(paths, name)?;
+    profile.validate()?;
     if !profile.is_connectable() {
-        bail!("profile '{}' has no doc_url", profile.name);
+        bail!(
+            "profile '{}' is not ready; run `openflux check-key {}` first",
+            profile.name,
+            profile.name
+        );
     }
     if tun::is_up(&tun_shell(paths)) {
         bail!("TUN mode is active; stop it with `pkexec openflux tun off` before starting an exit node");
@@ -308,14 +393,15 @@ pub fn exit_up(paths: &Paths, engine_bin: &Path, name: Option<&str>, debug: bool
         }
     }
 
+    let app_cfg = load(paths)?;
     let cfg = EngineConfig {
         bin: engine_bin.to_path_buf(),
-        url: profile.doc_url.clone(),
-        socks_port: profile.socks_port,
+        transport: TransportConfig::from_profile(&profile),
+        socks_port: app_cfg.socks_port,
         token: token_for(&profile),
         mtu: Some(profile.mtu),
         streams: profile.streams,
-        debug,
+        debug: debug || app_cfg.debug || env_debug(),
         log_file: paths.engine_log.clone(),
     };
     let pid = engine::start_exit(&cfg, READY_TIMEOUT)?;
@@ -360,10 +446,21 @@ pub fn proxy_down(paths: &Paths) -> Result<bool> {
 
 pub fn status(paths: &Paths) -> Result<Status> {
     let cfg = load(paths)?;
-    let engine = engine::current(&paths.engine_pid).map(|pid| EngineStatus {
-        pid,
-        mode: engine::current_mode(&paths.engine_pid).unwrap_or_else(|| "socks".to_string()),
-        port: engine::current_port(&paths.engine_pid, 0),
+    // Fall back to a /proc scan: without it a live engine whose pidfile is missing (the TUN
+    // engine is spawned by a root helper) is reported as "nothing running", which turns the
+    // Disconnect button into a Connect button and hides the tunnel that is holding the
+    // machine's routing.
+    let running = engine::discover_running(&paths.engine_pid);
+    let profile_port = cfg.socks_port;
+    let engine = running.as_ref().map(|r| EngineStatus {
+        pid: r.pid,
+        mode: r.mode.clone(),
+        // A /proc-discovered engine has no metadata file, so fall back to the recorded port
+        // and then to the profile's own; never report 0, which the UI would print as
+        // "socks5 127.0.0.1:0".
+        port: r
+            .socks_port
+            .unwrap_or_else(|| engine::current_port(&paths.engine_pid, profile_port)),
     });
     let proxy_on = proxy::is_on(&paths.proxy_state);
     let proxy_system_mode = if proxy_on {
@@ -375,7 +472,7 @@ pub fn status(paths: &Paths) -> Result<Status> {
         active_profile: cfg.active_profile.clone(),
         engine,
         tun_up: tun::is_up(&tun_shell(paths)),
-        exit_up: engine::current_mode(&paths.engine_pid).as_deref() == Some("exit"),
+        exit_up: running.as_ref().map(|r| r.mode == "exit").unwrap_or(false),
         proxy_on,
         proxy_system_mode,
         issue: engine::connection_issue(&paths.engine_log),
@@ -416,13 +513,31 @@ mod tests {
     }
 
     #[test]
+    fn tun_down_is_safe_when_nothing_is_up() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = paths(tmp.path());
+        let down = tun_down(&p).unwrap();
+        assert!(!down.was_up);
+        assert_eq!(down.engine_stopped, None);
+    }
+
+    #[test]
     fn status_reports_stopped_when_nothing_runs() {
         let tmp = tempfile::tempdir().unwrap();
         let p = paths(tmp.path());
         let s = status(&p).unwrap();
-        assert!(s.engine.is_none());
+        // `status` falls back to a /proc scan, so a *real* engine left running on the
+        // developer's machine is legitimately reported. What must never happen is an engine
+        // invented out of the empty state dir, so the invariant is: anything reported has to
+        // be a live `openflux-engine` process.
+        if let Some(e) = &s.engine {
+            let cmdline = std::fs::read(format!("/proc/{}/cmdline", e.pid)).unwrap();
+            assert!(
+                String::from_utf8_lossy(&cmdline).contains("openflux-engine"),
+                "engine {e:?} is not a live engine process"
+            );
+        }
         assert!(!s.tun_up);
         assert!(!s.proxy_on);
     }
 }
-

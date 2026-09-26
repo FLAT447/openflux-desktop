@@ -27,7 +27,7 @@ const LOG_LINES: usize = 200;
 struct App {
     paths: Paths,
     engine_bin: PathBuf,
-    names: Vec<String>,
+    profiles: Vec<(String, String)>,
     active: Option<String>,
     selected: usize,
     status: Status,
@@ -41,7 +41,7 @@ impl App {
         let mut app = App {
             paths: ctx.paths.clone(),
             engine_bin: ctx.engine_bin.clone(),
-            names: Vec::new(),
+            profiles: Vec::new(),
             active: None,
             selected: 0,
             status: actions::status(&ctx.paths)?,
@@ -55,10 +55,14 @@ impl App {
 
     fn refresh(&mut self) -> Result<()> {
         let cfg = actions::load(&self.paths)?;
-        self.names = cfg.profiles.iter().map(|p| p.name.clone()).collect();
+        self.profiles = cfg
+            .profiles
+            .iter()
+            .map(|p| (p.name.clone(), p.transport.to_string()))
+            .collect();
         self.active = cfg.active_profile.clone();
-        if self.selected >= self.names.len() {
-            self.selected = self.names.len().saturating_sub(1);
+        if self.selected >= self.profiles.len() {
+            self.selected = self.profiles.len().saturating_sub(1);
         }
         self.status = actions::status(&self.paths)?;
         self.log = read_log(&self.paths.engine_log);
@@ -66,7 +70,9 @@ impl App {
     }
 
     fn selected_name(&self) -> Option<String> {
-        self.names.get(self.selected).cloned()
+        self.profiles
+            .get(self.selected)
+            .map(|(name, _)| name.clone())
     }
 
     fn note(&mut self, message: impl Into<String>) {
@@ -78,10 +84,10 @@ impl App {
     }
 
     fn move_selection(&mut self, delta: isize) {
-        if self.names.is_empty() {
+        if self.profiles.is_empty() {
             return;
         }
-        let len = self.names.len() as isize;
+        let len = self.profiles.len() as isize;
         self.selected = ((self.selected as isize + delta).rem_euclid(len)) as usize;
     }
 
@@ -116,7 +122,7 @@ impl App {
 
     fn connect(&mut self) {
         let name = self.selected_name();
-        match actions::connect(&self.paths, &self.engine_bin, name.as_deref(), None) {
+        match actions::connect(&self.paths, &self.engine_bin, name.as_deref(), None, false) {
             Ok(o) => self.note(format!(
                 "connected '{}' (pid {}), socks 127.0.0.1:{}",
                 o.profile, o.pid, o.port
@@ -159,7 +165,11 @@ impl App {
         let turning_on = !self.status.tun_up;
         let sub = if turning_on { "on" } else { "off" };
         match run_privileged(terminal, &["tun", sub]) {
-            Ok(()) => self.note(if turning_on { "TUN mode up" } else { "TUN mode down" }),
+            Ok(()) => self.note(if turning_on {
+                "TUN mode up"
+            } else {
+                "TUN mode down"
+            }),
             Err(e) => self.note_err(e),
         }
         let _ = self.refresh();
@@ -269,7 +279,12 @@ fn draw(frame: &mut Frame, app: &App) {
 fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
     let active = app.active.as_deref().unwrap_or("<none>");
     let line = Line::from(vec![
-        Span::styled("OpenFlux", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "OpenFlux",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw("  active: "),
         Span::styled(active, Style::default().fg(Color::Yellow)),
     ]);
@@ -281,11 +296,17 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
 
 fn draw_profiles(frame: &mut Frame, area: Rect, app: &App) {
     let items: Vec<ListItem> = app
-        .names
+        .profiles
         .iter()
-        .map(|name| {
+        .map(|(name, transport)| {
             let is_active = app.active.as_deref() == Some(name.as_str());
-            let mut spans = vec![Span::raw(name.clone())];
+            let mut spans = vec![
+                Span::raw(name.clone()),
+                Span::styled(
+                    format!("  {transport}"),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ];
             if is_active {
                 spans.push(Span::styled(
                     "  (active)",
@@ -297,7 +318,7 @@ fn draw_profiles(frame: &mut Frame, area: Rect, app: &App) {
         .collect();
 
     let mut state = ListState::default();
-    if !app.names.is_empty() {
+    if !app.profiles.is_empty() {
         state.select(Some(app.selected));
     }
     let list = List::new(items)
@@ -311,12 +332,14 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
     let mut lines = Vec::new();
 
     match &app.status.engine {
-        Some(e) if e.mode == "tun" => {
-            lines.push(Line::from(format!("engine : running (pid {}), mode=tun", e.pid)))
-        }
-        Some(e) if e.mode == "exit" => {
-            lines.push(Line::from(format!("engine : running (pid {}), mode=exit-node", e.pid)))
-        }
+        Some(e) if e.mode == "tun" => lines.push(Line::from(format!(
+            "engine : running (pid {}), mode=tun",
+            e.pid
+        ))),
+        Some(e) if e.mode == "exit" => lines.push(Line::from(format!(
+            "engine : running (pid {}), mode=exit-node",
+            e.pid
+        ))),
         Some(e) => lines.push(Line::from(format!(
             "engine : running (pid {}), socks5=127.0.0.1:{}",
             e.pid, e.port
@@ -351,9 +374,10 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
         Span::styled("on", Style::default().fg(Color::Green))
     } else {
         match &app.status.proxy_system_mode {
-            Some(m) if m != "none" => {
-                Span::styled(format!("off (system mode: {m})"), Style::default().fg(Color::DarkGray))
-            }
+            Some(m) if m != "none" => Span::styled(
+                format!("off (system mode: {m})"),
+                Style::default().fg(Color::DarkGray),
+            ),
             _ => Span::styled("off", Style::default().fg(Color::DarkGray)),
         }
     };

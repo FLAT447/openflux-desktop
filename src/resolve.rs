@@ -9,12 +9,14 @@
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 
+use crate::config::Transport;
+
 #[derive(Debug, Clone)]
 pub struct ResolveResult {
     pub status: String,
     pub doc_url: String,
     pub doc_urls: Vec<String>,
-    pub transport: String,
+    pub transport: Transport,
     pub e2e_encryption: bool,
 }
 
@@ -26,13 +28,20 @@ pub fn resolve_key(control_url: &str, key_token: &str) -> Result<ResolveResult> 
     let out = std::process::Command::new("curl")
         .arg("-sS")
         .arg("--fail-with-body")
-        .arg("-m").arg("30")
-        .arg("-H").arg(format!("Authorization: Bearer {key_token}"))
-        .arg("-H").arg("Content-Type: application/json")
-        .arg("-H").arg("Accept: application/json")
-        .arg("-H").arg("User-Agent: openflux-cli/0.1")
-        .arg("-X").arg("POST")
-        .arg("--data").arg("")
+        .arg("-m")
+        .arg("30")
+        .arg("-H")
+        .arg(format!("Authorization: Bearer {key_token}"))
+        .arg("-H")
+        .arg("Content-Type: application/json")
+        .arg("-H")
+        .arg("Accept: application/json")
+        .arg("-H")
+        .arg("User-Agent: openflux-cli/0.1")
+        .arg("-X")
+        .arg("POST")
+        .arg("--data")
+        .arg("")
         .arg(&url)
         .output()
         .with_context(|| "curl not found; the CLI resolves key profiles through curl")?;
@@ -42,10 +51,18 @@ pub fn resolve_key(control_url: &str, key_token: &str) -> Result<ResolveResult> 
         if body.trim().is_empty() {
             body = String::from_utf8_lossy(&out.stderr).into_owned();
         }
-        bail!("resolve request to {url} failed (curl exit {}): {}", out.status, body.trim());
+        bail!(
+            "resolve request to {url} failed (curl exit {}): {}",
+            out.status,
+            body.trim()
+        );
     }
 
-    let json: Value = serde_json::from_str(&body).context("resolve response is not JSON")?;
+    parse_response(&body)
+}
+
+fn parse_response(body: &str) -> Result<ResolveResult> {
+    let json: Value = serde_json::from_str(body).context("resolve response is not JSON")?;
 
     let status = json
         .get("status")
@@ -53,36 +70,56 @@ pub fn resolve_key(control_url: &str, key_token: &str) -> Result<ResolveResult> 
         .context("resolve response missing 'status'")?
         .to_string();
 
-    let get_str = |key: &str| -> String {
-        json.get(key).and_then(Value::as_str).unwrap_or_default().to_string()
-    };
-
     if status != "active" {
         bail!("key is not active (status: {status})");
     }
 
-    let doc_url = get_str("doc_url");
-    if doc_url.is_empty() {
-        bail!("resolve returned active status but no doc_url");
-    }
+    let get_str = |key: &str| -> String {
+        json.get(key)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    };
 
+    let transport_name = get_str("transport");
+    let transport = if transport_name.is_empty() {
+        Transport::Yandex
+    } else {
+        transport_name
+            .parse()
+            .map_err(anyhow::Error::msg)
+            .with_context(|| format!("resolve returned unsupported transport '{transport_name}'"))?
+    };
+
+    let doc_url = get_str("doc_url");
     let doc_urls = json
         .get("doc_urls")
         .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
+        .map(|values| {
+            values
+                .iter()
                 .filter_map(Value::as_str)
-                .map(String::from)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+
+    if transport.requires_doc_url() && doc_url.is_empty() && doc_urls.is_empty() {
+        bail!("resolve returned active status but no document URL");
+    }
 
     Ok(ResolveResult {
         status,
         doc_url,
         doc_urls,
-        transport: get_str("transport"),
-        e2e_encryption: json.get("e2e_encryption").and_then(Value::as_bool).unwrap_or(false),
+        transport,
+        e2e_encryption: json
+            .get("e2e_encryption")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
     })
 }
 
@@ -93,24 +130,47 @@ mod tests {
     #[test]
     fn parses_active_response() {
         let json = r#"{"status":"active","doc_url":"https://disk.yandex.ru/i/x","doc_urls":["https://disk.yandex.ru/i/x"],"transport":"yandex","e2e_encryption":true,"bytes_used_total":123}"#;
-        // Deserialize through the same extraction used by resolve_key.
-        let value: Value = serde_json::from_str(json).unwrap();
-        let get_str = |key: &str| value.get(key).and_then(Value::as_str).unwrap_or_default().to_string();
-        let doc_urls = value
-            .get("doc_urls")
-            .and_then(Value::as_array)
-            .map(|arr| arr.iter().filter_map(Value::as_str).map(String::from).collect())
-            .unwrap_or_default();
-        let got = ResolveResult {
-            status: get_str("status"),
-            doc_url: get_str("doc_url"),
-            doc_urls,
-            transport: get_str("transport"),
-            e2e_encryption: value.get("e2e_encryption").and_then(Value::as_bool).unwrap_or(false),
-        };
+        let got = parse_response(json).unwrap();
         assert_eq!(got.status, "active");
         assert_eq!(got.doc_url, "https://disk.yandex.ru/i/x");
-        assert_eq!(got.transport, "yandex");
+        assert_eq!(got.transport, Transport::Yandex);
         assert!(got.e2e_encryption);
+    }
+
+    #[test]
+    fn parses_multistream_response() {
+        let json = r#"{"status":"active","doc_urls":["https://disk.yandex.ru/i/a","https://disk.yandex.ru/i/b"],"transport":"yandex_multistream"}"#;
+        let got = parse_response(json).unwrap();
+        assert_eq!(got.transport, Transport::YandexMultistream);
+        assert_eq!(got.doc_urls.len(), 2);
+    }
+
+    #[test]
+    fn parses_oneme_response_without_document_url() {
+        let json = r#"{"status":"active","transport":"oneme"}"#;
+        let got = parse_response(json).unwrap();
+        assert_eq!(got.transport, Transport::Oneme);
+        assert!(got.doc_url.is_empty());
+    }
+
+    #[test]
+    fn rejects_unknown_transport_and_missing_document_url() {
+        let unknown = r#"{"status":"active","transport":"carrier-pigeon","doc_url":"https://d"}"#;
+        assert!(parse_response(unknown).is_err());
+
+        let no_doc = r#"{"status":"active","transport":"volga"}"#;
+        assert!(parse_response(no_doc).is_err());
+
+        let inactive = r#"{"status":"revoked","doc_url":"https://d"}"#;
+        assert!(parse_response(inactive).is_err());
+    }
+
+    #[test]
+    fn multistream_without_enough_urls_is_rejected() {
+        let json =
+            r#"{"status":"active","transport":"yandex_multistream","doc_urls":["https://d/a"]}"#;
+        let got = parse_response(json).unwrap();
+        assert_eq!(got.transport, Transport::YandexMultistream);
+        assert_eq!(got.doc_urls.len(), 1);
     }
 }

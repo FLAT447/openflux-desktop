@@ -5,12 +5,14 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
 	"math"
 	"math/rand"
 	"net/http"
+	"net/http/cookiejar"
 	neturl "net/url"
 	"regexp"
 	"strconv"
@@ -58,7 +60,14 @@ const (
 	reasonHandshakeFailed = "handshake_failed"
 	reasonSendFailed      = "send_failed"
 	reasonReadError       = "read_error"
+	reasonCaptchaBlocked  = "captcha_blocked"
 )
+
+// errCaptchaBlocked marks a CAPTCHA/bot-check page returned instead of the doc editor.
+var errCaptchaBlocked = errors.New("captcha or bot-check page returned instead of the doc editor")
+
+// captchaCooldown is a floor under the usual attempt-scaled backoff for captcha failures.
+const captchaCooldown = 3 * time.Minute
 
 type YandexDocsInfo struct {
 	CookieStr   string
@@ -124,10 +133,57 @@ type YandexDocsTransport struct {
 
 	// tag identifies this instance's log lines on a node running many keys at once - a bare "[YDOCS]" line can't otherwise be traced back to which key it belongs to.
 	tag string
+
+	// providedCookies is set via ProvideCookies and resent on every future fetch.
+	providedCookies string
+
+	captchaSolveMode CaptchaSolveMode
+}
+
+// CaptchaSolveMode selects how an exit node reacts to a CAPTCHA failure - exit-node use only.
+type CaptchaSolveMode string
+
+const (
+	CaptchaSolveModeOff             CaptchaSolveMode = ""
+	CaptchaSolveModeHeadlessBrowser CaptchaSolveMode = "headless_browser"
+)
+
+func (t *YandexDocsTransport) SetCaptchaSolveMode(mode CaptchaSolveMode) {
+	t.captchaSolveMode = mode
+}
+
+func (t *YandexDocsTransport) tryHeadlessSolve(docURL string) {
+	cookies, err := SolveCaptcha(docURL)
+	if err != nil {
+		t.debugf("headless captcha solve failed, falling back to the normal cooldown: %v", err)
+		return
+	}
+	t.debugf("headless captcha solve succeeded, forcing a reconnect")
+	t.ProvideCookies(cookies)
 }
 
 func (t *YandexDocsTransport) debugf(format string, args ...interface{}) {
 	utils.Debugf("[YDOCS/%s] "+format, append([]interface{}{t.tag}, args...)...)
+}
+
+// ProvideCookies feeds a solved session's cookies into subsequent fetches and forces a reconnect.
+func (t *YandexDocsTransport) ProvideCookies(cookieStr string) {
+	t.Mu.Lock()
+	t.providedCookies = cookieStr
+	t.Mu.Unlock()
+	t.debugf("received %d bytes of externally-solved cookies, forcing a reconnect", len(cookieStr))
+	t.ForceReconnect()
+}
+
+func (t *YandexDocsTransport) getProvidedCookies() string {
+	t.Mu.RLock()
+	defer t.Mu.RUnlock()
+	return t.providedCookies
+}
+
+func parseCookieHeader(header string) []*http.Cookie {
+	req := &http.Request{Header: http.Header{"Cookie": {header}}}
+	return req.Cookies()
 }
 
 // EnableSelfCompression makes writerLoop zstd-compress a whole batch of raw packets once the peer's keepalive proves it understands zstdBatchMarker, beating per-packet LZ4's missed cross-packet redundancy; not for use alongside external CompressedTransport wrapping.
@@ -244,7 +300,14 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 		info, err := t.fetchDocInfo(t.url, userID)
 		if err != nil {
 			t.debugf("fetchDocInfo failed: %v", err)
-			t.scheduleReconnect(attempt, reasonFetchFailed, err)
+			if errors.Is(err, errCaptchaBlocked) {
+				if t.captchaSolveMode == CaptchaSolveModeHeadlessBrowser {
+					go t.tryHeadlessSolve(t.url)
+				}
+				t.scheduleReconnectWithMinDelay(attempt, reasonCaptchaBlocked, err, captchaCooldown)
+			} else {
+				t.scheduleReconnect(attempt, reasonFetchFailed, err)
+			}
 			return
 		}
 
@@ -790,6 +853,10 @@ func (t *YandexDocsTransport) extractBase64String(response string) string {
 }
 
 func (t *YandexDocsTransport) scheduleReconnect(attempt int, reasonCode string, cause error) {
+	t.scheduleReconnectWithMinDelay(attempt, reasonCode, cause, 0)
+}
+
+func (t *YandexDocsTransport) scheduleReconnectWithMinDelay(attempt int, reasonCode string, cause error, minDelay time.Duration) {
 	if !t.IsRunning() || attempt >= t.GetConfig().MaxReconnectAttempts {
 		return
 	}
@@ -797,6 +864,9 @@ func (t *YandexDocsTransport) scheduleReconnect(attempt int, reasonCode string, 
 	t.RecordReconnect()
 
 	delay := t.backoffDelay(attempt)
+	if delay < minDelay {
+		delay = minDelay
+	}
 	causeText := strings.ReplaceAll(cause.Error(), "\n", " ")
 	t.EmitEvent(transport.EventRetrying, fmt.Sprintf("%d|%d|%s|%s", attempt+1, int(delay.Seconds()), reasonCode, causeText))
 	if delay > 0 {
@@ -864,27 +934,101 @@ func (t *YandexDocsTransport) backoffDelay(attempt int) time.Duration {
 }
 
 func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, error) {
+	jar, _ := cookiejar.New(nil)
+	if parsed, err := neturl.Parse(url); err == nil {
+		if provided := t.getProvidedCookies(); provided != "" {
+			jar.SetCookies(parsed, parseCookieHeader(provided))
+		}
+	}
+
 	client := &http.Client{
-		CheckRedirect: func(req *http.Request, via []*http.Request) error { return nil },
-		Timeout:       30 * time.Second,
-		Transport:     &http.Transport{DialContext: transport.ProtectedDialer().DialContext},
+		Jar:       jar,
+		Timeout:   30 * time.Second,
+		Transport: &http.Transport{DialContext: transport.ProtectedDialer().DialContext},
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
 	}
 
-	req, _ := http.NewRequest("GET", url, nil)
-	applyBrowserGetHeaders(req.Header)
-	resp, err := client.Do(req)
-	if err != nil {
-		return YandexDocsInfo{}, err
+	currentURL := url
+	var resp *http.Response
+	var htmlBytes []byte
+	var finalCookies []*http.Cookie
+	var finalURL *neturl.URL
+	captchaAttempts := 0
+	solveChallenge := func() error {
+		if captchaAttempts > 0 {
+			return errCaptchaBlocked
+		}
+		captchaAttempts++
+		t.debugf("captcha challenge detected, solving via PoW")
+		t.EmitEvent(transport.EventCaptchaRequired, url)
+		if _, cerr := solveCaptcha(currentURL, jar, browserUserAgent, client.Transport); cerr != nil {
+			t.debugf("PoW captcha solve failed: %v", cerr)
+			return fmt.Errorf("%w: %v", errCaptchaBlocked, cerr)
+		}
+		t.debugf("PoW captcha solved, retrying")
+		currentURL = url
+		return nil
 	}
-	defer resp.Body.Close()
 
-	htmlBytes, _ := io.ReadAll(resp.Body)
+	for hop := 0; hop < 10; hop++ {
+		req, _ := http.NewRequest("GET", currentURL, nil)
+		applyBrowserGetHeaders(req.Header)
+		var err error
+		resp, err = client.Do(req)
+		if err != nil {
+			return YandexDocsInfo{}, err
+		}
+
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			htmlBytes, _ = io.ReadAll(resp.Body)
+			finalCookies = resp.Cookies()
+			finalURL = resp.Request.URL
+			resp.Body.Close()
+			if looksLikeCaptchaHTML(htmlBytes) {
+				if err := solveChallenge(); err != nil {
+					return YandexDocsInfo{}, err
+				}
+				continue
+			}
+			break
+		}
+		if resp.StatusCode < 300 || resp.StatusCode >= 400 {
+			resp.Body.Close()
+			return YandexDocsInfo{}, fmt.Errorf("unexpected status %d at %s", resp.StatusCode, currentURL)
+		}
+
+		loc, err := resp.Location()
+		resp.Body.Close()
+		if err != nil {
+			return YandexDocsInfo{}, fmt.Errorf("redirect from %s: %w", currentURL, err)
+		}
+
+		if isCaptchaURL(loc.String()) {
+			if err := solveChallenge(); err != nil {
+				return YandexDocsInfo{}, err
+			}
+			continue
+		}
+		currentURL = loc.String()
+	}
+
+	if resp == nil || len(htmlBytes) == 0 || finalURL == nil {
+		if captchaAttempts > 0 {
+			return YandexDocsInfo{}, errCaptchaBlocked
+		}
+		return YandexDocsInfo{}, fmt.Errorf("no successful response after redirects")
+	}
 	html := string(htmlBytes)
 
 	t.debugf("fetchDocInfo GET %s -> %d (%d bytes)", url, resp.StatusCode, len(html))
 
 	var cookies []string
-	for _, c := range resp.Cookies() {
+	for _, c := range finalCookies {
+		cookies = append(cookies, fmt.Sprintf("%s=%s", c.Name, c.Value))
+	}
+	for _, c := range jar.Cookies(finalURL) {
 		cookies = append(cookies, fmt.Sprintf("%s=%s", c.Name, c.Value))
 	}
 
@@ -892,15 +1036,26 @@ func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, 
 	matches := re.FindStringSubmatch(html)
 	if len(matches) < 2 {
 		lower := strings.ToLower(html)
-		if strings.Contains(lower, "captcha") {
+		isCaptcha := strings.Contains(lower, "captcha")
+		if isCaptcha {
 			t.debugf("response looks like a CAPTCHA/bot-check page, not the doc editor")
+			t.EmitEvent(transport.EventCaptchaRequired, url)
 		}
 		preview := html
 		if len(preview) > 2000 {
 			preview = preview[:2000]
 		}
 		t.debugf("HTML preview: %s", preview)
+		if isCaptcha {
+			return YandexDocsInfo{}, errCaptchaBlocked
+		}
 		return YandexDocsInfo{}, fmt.Errorf("config not found")
+	}
+
+	if joined := strings.Join(cookies, "; "); joined != "" {
+		t.Mu.Lock()
+		t.providedCookies = joined
+		t.Mu.Unlock()
 	}
 
 	var config map[string]interface{}

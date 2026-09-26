@@ -15,7 +15,10 @@
   (через туннель идут только указанные);
 - **шифрованный DNS** для TUN-шлюза — обычный `ip[:port]`, `tls://host` (DoT) или
   `https://host/path` (DoH);
-- **exit-node режим** — запуск этой машины крайней точкой туннеля для других пиров.
+- **exit-node режим** — запуск этой машины крайней точкой туннеля для других пиров;
+- **выбор транспорта** — `yandex`, `volga`, `oneme`, `yandex_multistream`,
+  `cupsonline`, `mailru` и экспериментальный `boards`, с кодеками `legacy`/`batched`
+  для универсальных транспортов.
 
 Три интерфейса делят одну реализацию: CLI, TUI (`openflux tui`) и [Tauri](https://tauri.app)
 GUI (`openflux-gui`) вызывают одну и ту же библиотеку `openflux::actions`, поэтому они
@@ -46,7 +49,7 @@ Linux (нужны toolchain'и Rust/Go, а для GUI также `webkit2gtk-4.1
 make            # cargo build --release + go build, копирует лаунчер в bin/
 make gui        # собирает gui/target/release/openflux-gui
 make lint       # cargo clippy -D warnings (оба крейта) + go vet
-make test       # cargo test
+make test       # cargo test (CLI + GUI) + go test (движок)
 ```
 
 Установка движка (выдаёт `cap_net_admin`, чтобы работал fwmark в TUN; TUN требует root):
@@ -67,16 +70,37 @@ make dist-windows GUI=1    # Windows: zip (openflux-<ver>-windows-<arch>.zip) + 
 
 ```sh
 openflux import  <ссылка-на-документ>      # импорт профиля из контроль-плоскости
-openflux add-profile demo --doc-url <url> \
-    --streams 2 --dns tls://1.1.1.1 \
-    --split-mode exclude --split-domains '*.ya.ru'
+openflux add-profile demo --transport yandex --doc-url <url> --streams 2
+openflux add-profile multi --transport yandex_multistream \
+    --doc-urls <url-1>,<url-2> --streams 2
+openflux add-profile max --transport oneme \
+    --max-token <token> --max-uid <uid> --streams 1
+openflux add-profile flaky --transport yandex --doc-url <url> \
+    --captcha-solve-mode headless_browser
 openflux edit-profile demo --streams 3
+openflux settings show                     # SOCKS5-порт, DNS, раздельный туннель
+openflux settings set --socks-port 1080 --dns tls://1.1.1.1 \
+    --split-mode exclude --split-domains '*.ya.ru'
 openflux connect                           # SOCKS5-режим клиента
 openflux proxy on                          # системный прокси -> SOCKS5
 openflux tun on                            # TUN-режим (pkexec; Windows: повышение прав)
 openflux exit on|off                       # запуск этой машины exit-node'ом
 openflux status | logs | tui
 ```
+
+SOCKS5-порт, DNS для TUN и раздельный туннель — общие настройки машины
+(`openflux settings`, в GUI кнопка «⚙» или «Настройки»), а не настройки профиля:
+они действуют для всех профилей сразу. Streams, MTU и captcha остаются per-profile.
+
+Для `yandex_multistream` нужны минимум два URL документа. Для `oneme` нужны
+положительное числовое значение `--max-uid` и `--max-token`. Сейчас контроль-плоскость
+предоставляет управляемые транспорты `yandex`, `yandex_multistream`, `mailru` и `boards`;
+остальные можно настроить вручную через CLI или GUI.
+
+`--captcha-solve-mode headless_browser` (только для транспортов Яндекса) заставляет
+движок открыть документ в локальном headless-браузере и сам пройти проверку; нужен
+установленный Chrome/Chromium. По умолчанию `off` — о блокировке только сообщается в
+журнале движка.
 
 В TUI: `c` connect, `d` disconnect, `p` proxy, `t` TUN (приостанавливается ради polkit),
 `e` exit node, `Enter` активировать профиль, `q` выход.

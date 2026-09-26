@@ -39,11 +39,15 @@ install-gui: gui
 VERSION ?= 0.1.0
 DIST_NAME := openflux-$(VERSION)-linux-$(shell uname -m)
 GUI ?= 0
+# A GUI binary left in bin/ by an earlier build must never be shipped as if it were
+# current: whenever one is present (or GUI=1 is passed) it is rebuilt from the current
+# sources first, so a bundle can only ever contain a freshly built GUI. A bare
+# `make dist` therefore never bundles a stale openflux-gui - the failure mode where the
+# old binary rejects transports the new one supports.
 dist: cargo engine
-	@if [ "$(GUI)" = 1 ]; then cd gui && cargo build --release --locked; fi
+	@if [ "$(GUI)" = 1 ] || [ -f bin/openflux-gui ]; then $(MAKE) gui && cp -f gui/target/release/openflux-gui bin/openflux-gui; else echo "no GUI requested (GUI=0) and no bin/openflux-gui: bundling CLI + engine only"; fi
 	@mkdir -p bin
 	@cp -f target/release/openflux bin/openflux
-	@if [ "$(GUI)" = 1 ]; then cp -f gui/target/release/openflux-gui bin/openflux-gui; fi
 	@rm -rf dist/$(DIST_NAME) dist/$(DIST_NAME).tar.gz
 	@mkdir -p dist/$(DIST_NAME)
 	@cp -f bin/openflux dist/$(DIST_NAME)/
@@ -69,7 +73,7 @@ WIN_TARGET := x86_64-pc-windows-gnu
 DIST_NAME_WIN := openflux-$(VERSION)-windows-x86_64
 WINTUN_URL ?= https://www.wintun.net/builds/wintun-0.14.1.zip
 dist-windows: cargo-windows engine-windows
-	@if [ "$(GUI)" = 1 ]; then $(MAKE) gui-windows; fi
+	@if [ "$(GUI)" = 1 ] || [ -f bin/openflux-gui.exe ]; then $(MAKE) gui-windows; else echo "no GUI requested (GUI=0) and no bin/openflux-gui.exe: bundling CLI + engine only"; fi
 	@mkdir -p dist/$(DIST_NAME_WIN)
 	@cp -f target/$(WIN_TARGET)/release/openflux.exe dist/$(DIST_NAME_WIN)/openflux.exe
 	@cp -f engine/openflux-engine.exe dist/$(DIST_NAME_WIN)/openflux-engine.exe
@@ -104,7 +108,9 @@ gui-windows:
 	@cp -f gui/target/$(WIN_TARGET)/release/openflux-gui.exe bin/openflux-gui.exe
 
 test:
-	cargo test
+	cargo test --locked
+	cd gui && cargo test --locked
+	cd engine && go test -mod=vendor ./...
 
 lint:
 	cargo clippy --all-targets -- -D warnings

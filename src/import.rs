@@ -1,21 +1,21 @@
 //! Profile import via `openflux://import?data=<base64url-json>`, mirroring the Android
 //! app's `ProfileDeepLink` (payload = JSON without the profile id, base64url without
-//! padding). The v1 desktop client keeps the same fields and ignores what it has no use
-//! for yet (max_token/max_uid/transport).
+//! padding). The desktop client stores all transport-specific fields supplied by the link.
 
 use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
 use base64::Engine;
 use serde::Deserialize;
 
-use crate::config::{Profile, ProfileMode, DEFAULT_DNS, DEFAULT_MTU, DEFAULT_SOCKS_PORT};
+use crate::config::{
+    Codec, Profile, ProfileMode, Transport, DEFAULT_MTU,
+};
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 struct ImportProfile {
     #[serde(default)]
     name: String,
-    /// `"manual"` → manual profile, anything else is treated as a key profile.
     #[serde(default)]
     mode: String,
     #[serde(default)]
@@ -25,52 +25,112 @@ struct ImportProfile {
     #[serde(default)]
     transport: String,
     #[serde(default)]
+    codec: String,
+    #[serde(default)]
     doc_url: String,
     #[serde(default)]
     doc_urls: Vec<String>,
+    #[serde(default)]
+    max_token: String,
+    #[serde(default)]
+    max_uid: Option<StringOrNumber>,
     #[serde(default = "default_mtu")]
     mtu: u32,
-    #[serde(default = "default_dns")]
-    dns_upstream: String,
+    /// DNS upstream for TUN mode. Global, not profile data: the import hands it back
+    /// separately. `Option` so "the link said nothing" stays distinguishable from "the link
+    /// said the default"; `alias` keeps links built by older versions working.
+    #[serde(default, alias = "dns")]
+    dns_upstream: Option<String>,
     #[serde(default)]
     e2e_encryption: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum StringOrNumber {
+    String(String),
+    Number(i64),
 }
 
 fn default_mtu() -> u32 {
     DEFAULT_MTU
 }
-fn default_dns() -> String {
-    DEFAULT_DNS.to_string()
+/// What a share link produced: the profile, plus the global settings it carried.
+#[derive(Debug)]
+pub struct Imported {
+    pub profile: Profile,
+    /// DNS upstream, when the link specified one.
+    pub dns: Option<String>,
 }
 
 /// Import a profile from an `openflux://import?data=...` deep link or a raw base64url
 /// string.
-pub fn import_link(input: &str) -> Result<Profile> {
+pub fn import_link(input: &str) -> Result<Imported> {
     let b64 = extract_data_param(input);
     let json = decode_base64(&b64)?;
     let parsed: ImportProfile = serde_json::from_slice(&json).context("parse import payload")?;
     if parsed.name.trim().is_empty() {
         bail!("import payload misses a profile name");
     }
-    let mode = if parsed.mode == "manual" { ProfileMode::Manual } else { ProfileMode::Key };
-    if !parsed.transport.is_empty() && parsed.transport != "yandex" {
-        bail!(
-            "import payload uses unsupported transport '{}' (v1 supports only yandex)",
-            parsed.transport
-        );
-    }
-    Ok(Profile {
+    let mode = if parsed.mode == "manual" {
+        ProfileMode::Manual
+    } else {
+        ProfileMode::Key
+    };
+    let transport = if parsed.transport.trim().is_empty() {
+        Transport::Yandex
+    } else {
+        parsed
+            .transport
+            .parse::<Transport>()
+            .map_err(anyhow::Error::msg)
+            .context("invalid transport in import payload")?
+    };
+    let codec = if parsed.codec.trim().is_empty() {
+        Codec::Legacy
+    } else {
+        parsed
+            .codec
+            .parse::<Codec>()
+            .map_err(anyhow::Error::msg)
+            .context("invalid codec in import payload")?
+    };
+    let max_uid = parsed
+        .max_uid
+        .map(|value| match value {
+            StringOrNumber::String(value) => value,
+            StringOrNumber::Number(value) => value.to_string(),
+        })
+        .unwrap_or_default();
+    let doc_urls = parsed.doc_urls;
+    let streams = if transport == Transport::YandexMultistream && doc_urls.len() >= 2 {
+        u16::try_from(doc_urls.len()).unwrap_or(u16::MAX)
+    } else {
+        1
+    };
+    let profile = Profile {
         name: parsed.name,
         mode,
         doc_url: parsed.doc_url,
-        doc_urls: parsed.doc_urls,
+        doc_urls,
         control_url: parsed.control_url,
         key_token: parsed.key_token,
+        transport,
+        codec,
+        max_token: parsed.max_token,
+        max_uid,
         e2e_encryption: parsed.e2e_encryption,
         mtu: parsed.mtu,
-        dns_upstream: parsed.dns_upstream,
-        socks_port: DEFAULT_SOCKS_PORT,
+        streams,
         ..Profile::default()
+    };
+    profile.validate()?;
+    Ok(Imported {
+        profile,
+        dns: parsed
+            .dns_upstream
+            .map(|d| d.trim().to_string())
+            .filter(|d| !d.is_empty()),
     })
 }
 
@@ -154,7 +214,8 @@ mod tests {
 
     #[test]
     fn decodes_sample_deep_link() {
-        let p = import_link(&format!("openflux://import?data={SAMPLE}")).unwrap();
+        let imported = import_link(&format!("openflux://import?data={SAMPLE}")).unwrap();
+        let p = imported.profile;
         assert_eq!(p.name, "demo");
         assert_eq!(p.mode, ProfileMode::Key);
         assert_eq!(p.control_url, "https://203.0.113.10");
@@ -166,13 +227,101 @@ mod tests {
 
     #[test]
     fn raw_base64_also_works() {
-        let p = import_link(SAMPLE).unwrap();
+        let p = import_link(SAMPLE).unwrap().profile;
         assert_eq!(p.name, "demo");
     }
 
     #[test]
     fn percent_escape_is_decoded() {
-        let p = import_link(&format!("openflux://import?data={SAMPLE}%3D")).unwrap();
+        let p = import_link(&format!("openflux://import?data={SAMPLE}%3D"))
+            .unwrap()
+            .profile;
         assert_eq!(p.name, "demo");
+    }
+
+    #[test]
+    fn imports_transport_specific_fields() {
+        let payload = URL_SAFE_NO_PAD.encode(
+            br#"{"name":"max","mode":"manual","transport":"oneme","codec":"batched","max_token":"token","max_uid":42}"#,
+        );
+        let profile = import_link(&payload).unwrap().profile;
+        assert_eq!(profile.transport, Transport::Oneme);
+        assert_eq!(profile.codec, Codec::Batched);
+        assert_eq!(profile.max_token, "token");
+        assert_eq!(profile.max_uid, "42");
+    }
+
+    #[test]
+    fn imports_multistream_urls_and_sets_stream_count() {
+        let payload = URL_SAFE_NO_PAD.encode(
+            br#"{"name":"multi","mode":"manual","transport":"yandex_multistream","doc_urls":["https://docs.yandex.ru/i/a","https://docs.yandex.ru/i/b"]}"#,
+        );
+        let profile = import_link(&payload).unwrap().profile;
+        assert_eq!(profile.transport, Transport::YandexMultistream);
+        assert_eq!(profile.streams, 2);
+        assert!(profile.is_connectable());
+    }
+
+    #[test]
+    fn legacy_payload_without_transport_stays_oneme_free_yandex() {
+        let profile = import_link(SAMPLE).unwrap().profile;
+        assert_eq!(profile.transport, Transport::Yandex);
+        assert_eq!(profile.codec, Codec::Legacy);
+        assert_eq!(profile.streams, 1);
+    }
+
+    #[test]
+    fn key_oneme_payload_without_credentials_is_rejected() {
+        let payload = URL_SAFE_NO_PAD.encode(
+            br#"{"name":"remote","mode":"key","transport":"oneme","control_url":"https://control.example.com","key_token":"t"}"#,
+        );
+        assert!(import_link(&payload).is_err());
+
+        let with_credentials = URL_SAFE_NO_PAD.encode(
+            br#"{"name":"remote","mode":"key","transport":"oneme","control_url":"https://control.example.com","key_token":"t","max_token":"max-t","max_uid":7}"#,
+        );
+        let profile = import_link(&with_credentials).unwrap().profile;
+        assert_eq!(profile.max_token, "max-t");
+        assert_eq!(profile.max_uid, "7");
+        assert!(profile.is_connectable());
+    }
+
+    #[test]
+    fn a_link_can_carry_the_global_dns() {
+        let payload = URL_SAFE_NO_PAD.encode(
+            br#"{"name":"dns","mode":"manual","doc_url":"https://docs.yandex.ru/i/a","dns":"1.1.1.1"}"#,
+        );
+        let imported = import_link(&payload).unwrap();
+        assert_eq!(imported.dns.as_deref(), Some("1.1.1.1"));
+        // Older links spelled the same key `dns_upstream`; both are accepted.
+        let legacy = URL_SAFE_NO_PAD.encode(
+            br#"{"name":"dns","mode":"manual","doc_url":"https://docs.yandex.ru/i/a","dns_upstream":"9.9.9.9"}"#,
+        );
+        assert_eq!(
+            import_link(&legacy).unwrap().dns.as_deref(),
+            Some("9.9.9.9")
+        );
+        // A link that says nothing leaves the global alone.
+        assert_eq!(import_link(SAMPLE).unwrap().dns, None);
+    }
+
+    #[test]
+    fn rejects_unknown_transport_and_codec() {
+        let transport = URL_SAFE_NO_PAD.encode(
+            br#"{"name":"x","mode":"manual","transport":"carrier-pigeon","doc_url":"https://d"}"#,
+        );
+        assert!(import_link(&transport).is_err());
+
+        let codec = URL_SAFE_NO_PAD
+            .encode(br#"{"name":"x","mode":"manual","codec":"zstd","doc_url":"https://d"}"#);
+        assert!(import_link(&codec).is_err());
+    }
+
+    #[test]
+    fn rejects_multistream_payload_with_a_single_url() {
+        let payload = URL_SAFE_NO_PAD.encode(
+            br#"{"name":"multi","mode":"manual","transport":"yandex_multistream","doc_urls":["https://docs.yandex.ru/i/a"]}"#,
+        );
+        assert!(import_link(&payload).is_err());
     }
 }

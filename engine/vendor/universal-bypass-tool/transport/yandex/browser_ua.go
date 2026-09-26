@@ -2,8 +2,7 @@ package yandex
 
 import "net/http"
 
-// browserUserAgent is a real, currently-plausible Firefox fingerprint; a convincing header set can't fix IP-reputation challenges, but an otherwise bare request (User-Agent only) was itself a detectable tell.
-const browserUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0"
+const browserUserAgent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
 // applyBrowserGetHeaders deliberately skips Accept-Encoding (would disable Go's transparent decompression) and Chromium-only Sec-Ch-Ua hints (a Firefox UA sending them is a bigger tell than sending neither).
 func applyBrowserGetHeaders(h http.Header) {

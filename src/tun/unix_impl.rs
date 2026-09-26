@@ -50,10 +50,7 @@ fn open_tun(name: &str) -> Result<i32> {
     // Deliberately no O_CLOEXEC: the child engine inherits this fd by number.
     let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR) };
     if fd < 0 {
-        bail!(
-            "open /dev/net/tun: {}",
-            std::io::Error::last_os_error()
-        );
+        bail!("open /dev/net/tun: {}", std::io::Error::last_os_error());
     }
 
     let mut ifr: Ifreq = unsafe { std::mem::zeroed() };
@@ -66,15 +63,87 @@ fn open_tun(name: &str) -> Result<i32> {
     if rc < 0 {
         let err = std::io::Error::last_os_error();
         unsafe { libc::close(fd) };
+        if err.raw_os_error() == Some(libc::EBUSY) {
+            bail!("{}", device_busy_message(name));
+        }
         bail!("TUNSETIFF {name}: {err}");
     }
     Ok(fd)
 }
 
+/// Whether a network interface with this name currently exists.
+fn interface_exists(name: &str) -> bool {
+    std::path::Path::new("/sys/class/net").join(name).exists()
+}
+
+/// Processes holding an open fd on /dev/net/tun. Readable only as root, which is the context
+/// `on()` runs in; used to name the process behind "Device or resource busy".
+fn tun_device_holders() -> Vec<i32> {
+    let mut holders = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return holders;
+    };
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Ok(pid) = name.parse::<i32>() else {
+            continue;
+        };
+        let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+            continue;
+        };
+        let holds = fds.flatten().any(|fd| {
+            std::fs::read_link(fd.path())
+                .map(|t| t == std::path::Path::new("/dev/net/tun"))
+                .unwrap_or(false)
+        });
+        if holds {
+            holders.push(pid);
+        }
+    }
+    holders
+}
+
+/// A TUN device is created non-persistent, so a leftover `openflux` interface always means
+/// somebody still holds it: a session that was never torn down. Say who, and how to stop it,
+/// instead of letting the raw EBUSY surface ("Text file busy"/"Device or resource busy").
+fn device_busy_message(name: &str) -> String {
+    let holders = tun_device_holders();
+    let who = if holders.is_empty() {
+        "another process (its /dev/net/tun fd is not visible from here)".to_string()
+    } else {
+        holders
+            .iter()
+            .map(
+                |p| match std::fs::read_to_string(format!("/proc/{p}/comm")) {
+                    Ok(comm) if !comm.trim().is_empty() => format!("{p} ({})", comm.trim()),
+                    _ => p.to_string(),
+                },
+            )
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    format!(
+        "the {name} TUN device is already in use by {who}.\n\
+         A TUN session from before is still running: stop it before starting a new one.\n  \
+         pkexec openflux tun off\n\
+         If that reports nothing, the holder survived a crash: kill it (sudo kill <pid>), then\n\
+         run `pkexec openflux tun off` once more to drop the routing rules it left behind."
+    )
+}
+
 fn run(prog: &str, args: &[&str]) -> Result<String> {
-    let out = Command::new(prog).args(args).output().with_context(|| format!("run {prog}"))?;
+    let out = Command::new(prog)
+        .args(args)
+        .output()
+        .with_context(|| format!("run {prog}"))?;
     if !out.status.success() {
-        bail!("`{prog} {}` failed: {}", args.join(" "), String::from_utf8_lossy(&out.stderr));
+        bail!(
+            "`{prog} {}` failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
@@ -106,20 +175,67 @@ pub fn lan_cidr() -> Option<String> {
 fn add_policy_routing(tun_name: &str) -> Result<()> {
     let lan = lan_cidr();
     // idempotent (ignore "File exists").
-    run_ok("ip", &["route", "add", "0.0.0.0/1", "dev", tun_name, "table", &TUN_ROUTE_TABLE.to_string()]);
-    run_ok("ip", &["route", "add", "128.0.0.0/1", "dev", tun_name, "table", &TUN_ROUTE_TABLE.to_string()]);
-    run_ok("ip", &["rule", "add", "pref", &TUN_TABLE_PRIO.to_string(), "lookup", &TUN_ROUTE_TABLE.to_string()]);
     run_ok(
         "ip",
         &[
-            "rule", "add", "pref", &FWMARK_RULE_PRIO.to_string(), "fwmark",
-            &format!("{:#x}", crate::FWMARK), "lookup", "main",
+            "route",
+            "add",
+            "0.0.0.0/1",
+            "dev",
+            tun_name,
+            "table",
+            &TUN_ROUTE_TABLE.to_string(),
+        ],
+    );
+    run_ok(
+        "ip",
+        &[
+            "route",
+            "add",
+            "128.0.0.0/1",
+            "dev",
+            tun_name,
+            "table",
+            &TUN_ROUTE_TABLE.to_string(),
+        ],
+    );
+    run_ok(
+        "ip",
+        &[
+            "rule",
+            "add",
+            "pref",
+            &TUN_TABLE_PRIO.to_string(),
+            "lookup",
+            &TUN_ROUTE_TABLE.to_string(),
+        ],
+    );
+    run_ok(
+        "ip",
+        &[
+            "rule",
+            "add",
+            "pref",
+            &FWMARK_RULE_PRIO.to_string(),
+            "fwmark",
+            &format!("{:#x}", crate::FWMARK),
+            "lookup",
+            "main",
         ],
     );
     if let Some(lan) = lan {
         run_ok(
             "ip",
-            &["rule", "add", "pref", &LAN_RULE_PRIO.to_string(), "to", &lan, "lookup", "main"],
+            &[
+                "rule",
+                "add",
+                "pref",
+                &LAN_RULE_PRIO.to_string(),
+                "to",
+                &lan,
+                "lookup",
+                "main",
+            ],
         );
     }
     Ok(())
@@ -129,15 +245,46 @@ fn del_policy_routing(tun_name: &str) {
     run_ok(
         "ip",
         &[
-            "rule", "del", "pref", &FWMARK_RULE_PRIO.to_string(), "fwmark",
-            &format!("{:#x}", crate::FWMARK), "lookup", "main",
+            "rule",
+            "del",
+            "pref",
+            &FWMARK_RULE_PRIO.to_string(),
+            "fwmark",
+            &format!("{:#x}", crate::FWMARK),
+            "lookup",
+            "main",
         ],
     );
-    run_ok("ip", &["rule", "del", "pref", &TUN_TABLE_PRIO.to_string(), "lookup", &TUN_ROUTE_TABLE.to_string()]);
+    run_ok(
+        "ip",
+        &[
+            "rule",
+            "del",
+            "pref",
+            &TUN_TABLE_PRIO.to_string(),
+            "lookup",
+            &TUN_ROUTE_TABLE.to_string(),
+        ],
+    );
     if let Some(lan) = lan_cidr() {
-        run_ok("ip", &["rule", "del", "pref", &LAN_RULE_PRIO.to_string(), "to", &lan, "lookup", "main"]);
+        run_ok(
+            "ip",
+            &[
+                "rule",
+                "del",
+                "pref",
+                &LAN_RULE_PRIO.to_string(),
+                "to",
+                &lan,
+                "lookup",
+                "main",
+            ],
+        );
     }
-    run_ok("ip", &["route", "flush", "table", &TUN_ROUTE_TABLE.to_string()]);
+    run_ok(
+        "ip",
+        &["route", "flush", "table", &TUN_ROUTE_TABLE.to_string()],
+    );
     let _ = tun_name;
 }
 
@@ -156,9 +303,18 @@ pub fn on(cfg: &super::TunConfig) -> Result<i32> {
     require_root()?;
 
     if let Some(pid) = state::read_pid(&cfg.engine_pid) {
-        if state::is_alive(pid) && state::pid_meta(&cfg.engine_pid, "mode").as_deref() == Some("tun") {
+        if state::is_alive(pid)
+            && state::pid_meta(&cfg.engine_pid, "mode").as_deref() == Some("tun")
+        {
             return Ok(pid); // already up
         }
+    }
+
+    // A previous session's interface outlives it only while something still holds the
+    // device. Catching that here turns an opaque EBUSY from the ioctl into an explanation
+    // plus the command that clears it.
+    if interface_exists(&cfg.tun_name) {
+        bail!("{}", device_busy_message(&cfg.tun_name));
     }
 
     let fd = open_tun(&cfg.tun_name)?;
@@ -167,7 +323,17 @@ pub fn on(cfg: &super::TunConfig) -> Result<i32> {
     // some process holds it).
     let setup = (|| -> Result<()> {
         run_ok("ip", &["addr", "add", &cfg.tun_addr, "dev", &cfg.tun_name]);
-        run("ip", &["link", "set", &cfg.tun_name, "mtu", &cfg.mtu.to_string(), "up"])?;
+        run(
+            "ip",
+            &[
+                "link",
+                "set",
+                &cfg.tun_name,
+                "mtu",
+                &cfg.mtu.to_string(),
+                "up",
+            ],
+        )?;
         add_policy_routing(&cfg.tun_name)
     })();
     if let Err(e) = setup {
@@ -183,11 +349,9 @@ pub fn on(cfg: &super::TunConfig) -> Result<i32> {
 
     let build = |drop: Option<(u32, u32)>| -> Result<Command> {
         let mut cmd = Command::new(&cfg.engine_bin);
-        cmd.arg("--tun-fd")
-            .arg(fd.to_string())
-            .arg("--url")
-            .arg(&cfg.url)
-            .arg("--dns")
+        cmd.arg("--tun-fd").arg(fd.to_string());
+        cfg.transport.apply(&mut cmd);
+        cmd.arg("--dns")
             .arg(&cfg.dns)
             .arg("--sock-mark")
             .arg(format!("{:#x}", crate::FWMARK))
@@ -222,7 +386,8 @@ pub fn on(cfg: &super::TunConfig) -> Result<i32> {
         if let Some((uid, gid)) = drop {
             cmd.uid(uid).gid(gid);
         }
-        cmd.stdout(Stdio::from(log.try_clone().context("clone engine log")?))
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::from(log.try_clone().context("clone engine log")?))
             .stderr(Stdio::from(log.try_clone().context("clone engine log")?));
         Ok(cmd)
     };
@@ -232,7 +397,8 @@ pub fn on(cfg: &super::TunConfig) -> Result<i32> {
     // because we only need the already-open fd.
     let spawned = (|| -> Result<std::process::Child> {
         match build(invoking_ids()).and_then(|mut c| {
-            c.spawn().with_context(|| format!("spawn engine {}", cfg.engine_bin.display()))
+            c.spawn()
+                .with_context(|| format!("spawn engine {}", cfg.engine_bin.display()))
         }) {
             Ok(child) => Ok(child),
             Err(e)
@@ -241,7 +407,9 @@ pub fn on(cfg: &super::TunConfig) -> Result<i32> {
                     .and_then(std::io::Error::raw_os_error)
                     == Some(libc::EAGAIN) =>
             {
-                eprintln!("warning: cannot drop privileges for the engine ({e}); running it as root");
+                eprintln!(
+                    "warning: cannot drop privileges for the engine ({e}); running it as root"
+                );
                 build(None)?
                     .spawn()
                     .with_context(|| format!("spawn engine {}", cfg.engine_bin.display()))
@@ -258,7 +426,14 @@ pub fn on(cfg: &super::TunConfig) -> Result<i32> {
         }
     };
     let pid = child.id() as i32;
-    state::write_pid(&cfg.engine_pid, pid, Some("mode=tun".into()))?;
+    if let Err(e) = state::write_pid(&cfg.engine_pid, pid, Some("mode=tun".into())) {
+        // Without a pidfile nothing can ever stop this engine again, and the device stays
+        // held, so the next `tun on` fails with EBUSY. Never leave that behind.
+        let _ = state::terminate(pid, Duration::from_secs(5));
+        del_policy_routing(&cfg.tun_name);
+        unsafe { libc::close(fd) };
+        return Err(e).context("record the TUN engine pid");
+    }
 
     // Give the gateway a moment; if it dies immediately, surface it.
     std::thread::sleep(Duration::from_millis(600));
@@ -266,7 +441,10 @@ pub fn on(cfg: &super::TunConfig) -> Result<i32> {
         del_policy_routing(&cfg.tun_name);
         state::remove_pid(&cfg.engine_pid);
         unsafe { libc::close(fd) };
-        bail!("engine exited during TUN startup; see {}", cfg.engine_log.display());
+        bail!(
+            "engine exited during TUN startup; see {}",
+            cfg.engine_log.display()
+        );
     }
 
     // The parent no longer needs its fd copy; the engine owns it now.
@@ -281,7 +459,9 @@ pub fn on(cfg: &super::TunConfig) -> Result<i32> {
 /// (`pkexec openflux tun off`) can still find the engine.
 pub fn off(cfg: &super::TunConfig) -> Result<()> {
     if let Some(pid) = state::read_pid(&cfg.engine_pid) {
-        if state::is_alive(pid) && state::pid_meta(&cfg.engine_pid, "mode").as_deref() == Some("tun") {
+        if state::is_alive(pid)
+            && state::pid_meta(&cfg.engine_pid, "mode").as_deref() == Some("tun")
+        {
             match state::terminate(pid, Duration::from_secs(5)) {
                 Ok(()) => state::remove_pid(&cfg.engine_pid),
                 Err(e) => {
@@ -296,15 +476,47 @@ pub fn off(cfg: &super::TunConfig) -> Result<()> {
     Ok(())
 }
 
-/// Whether TUN mode is currently up (engine pidfile records mode=tun and is alive).
+/// Whether TUN mode is currently up: either the pidfile records a live TUN engine, or -
+/// when that record is missing - a live engine holds the device (`--tun-fd`). The second
+/// half matters because the TUN engine is spawned by a root helper, so its pidfile is not
+/// always where the unprivileged UI looks, and "not up" then means the UI cannot switch the
+/// tunnel off.
 pub fn is_up(cfg: &super::TunConfig) -> bool {
-    matches!(state::read_pid(&cfg.engine_pid), Some(pid) if state::is_alive(pid)
+    if matches!(state::read_pid(&cfg.engine_pid), Some(pid) if state::is_alive(pid)
         && state::pid_meta(&cfg.engine_pid, "mode").as_deref() == Some("tun"))
+    {
+        return true;
+    }
+    if !interface_exists(&cfg.tun_name) {
+        return false;
+    }
+    crate::engine::discover_running(&cfg.engine_pid).is_some_and(|r| r.mode == "tun")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_name_that_is_not_an_interface_is_reported_absent() {
+        assert!(!interface_exists("openflux-nonexistent-iface"));
+    }
+
+    #[test]
+    fn the_tun_holder_scan_is_safe_to_call_unprivileged() {
+        // We do not hold /dev/net/tun here, so the list must be empty rather than an error;
+        // the point is that the diagnostic path never panics or fails the caller.
+        let holders = tun_device_holders();
+        assert!(!holders.contains(&(std::process::id() as i32)));
+    }
+
+    #[test]
+    fn the_busy_message_names_the_way_out() {
+        let msg = device_busy_message("openflux");
+        assert!(msg.contains("already in use"), "{msg}");
+        assert!(msg.contains("pkexec openflux tun off"), "{msg}");
+        println!("{msg}");
+    }
 
     #[test]
     fn lan_cidr_parses_when_default_route_exists() {

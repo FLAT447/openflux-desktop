@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use openflux::actions;
-use openflux::config::{AppConfig, Profile, ProfileMode};
+use openflux::config::{AppConfig, Codec, Profile, ProfileMode, Transport};
 use openflux::engine;
 use openflux::paths::Paths;
 use openflux::proxy::Backend;
@@ -18,7 +18,11 @@ use openflux::{FWMARK, TUN_NAME};
 mod tui;
 
 #[derive(Parser)]
-#[command(name = "openflux", version, about = "OpenFlux desktop client: TUN mode and system proxy on/off")]
+#[command(
+    name = "openflux",
+    version,
+    about = "OpenFlux desktop client: TUN mode and system proxy on/off"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -42,8 +46,11 @@ enum Command {
     ListProfiles,
     /// Remove a profile.
     RmProfile(RmProfileArgs),
-    /// Edit tunnel options of an existing profile (streams, DNS, split).
+    /// Edit tunnel options of an existing profile (streams, MTU, captcha).
     EditProfile(EditProfileArgs),
+    /// Machine-wide settings: SOCKS5 port, TUN DNS and split tunneling.
+    #[command(subcommand)]
+    Settings(SettingsCmd),
     /// Set the active profile.
     SetActive(ActiveArgs),
     /// Resolve the key against the controlplane and store the doc URL.
@@ -73,10 +80,25 @@ enum Command {
 struct AddProfileArgs {
     /// Profile name.
     name: String,
-    /// Profile mode: manual (a doc URL) or key (controlplane token).
+    /// Profile mode: manual (a document URL) or key (controlplane token).
     #[arg(long, value_enum, default_value_t = ProfileModeArg::Manual)]
     mode: ProfileModeArg,
-    /// Manual mode: Yandex Docs URL.
+    /// Transport implementation.
+    #[arg(long, value_parser = ["yandex", "volga", "oneme", "yandex_multistream", "cupsonline", "mailru", "boards"])]
+    transport: Option<String>,
+    /// Wire codec for non-Yandex transports.
+    #[arg(long, value_parser = ["legacy", "batched"])]
+    codec: Option<String>,
+    /// Comma-separated document URLs for yandex_multistream.
+    #[arg(long)]
+    doc_urls: Option<String>,
+    /// OneMe MAX token.
+    #[arg(long)]
+    max_token: Option<String>,
+    /// OneMe target user id.
+    #[arg(long)]
+    max_uid: Option<String>,
+    /// Manual mode: document URL.
     #[arg(long)]
     doc_url: Option<String>,
     /// Key mode: controlplane base URL.
@@ -85,26 +107,16 @@ struct AddProfileArgs {
     /// Key mode: key token (the Yandex Docs shared-link token).
     #[arg(long)]
     key_token: Option<String>,
-    /// Override the SOCKS5 listen port.
-    #[arg(long)]
-    socks_port: Option<u16>,
     /// Override the tunnel MTU.
     #[arg(long)]
     mtu: Option<u32>,
     /// Parallel WebSocket streams (multistream, 1-8).
     #[arg(long)]
     streams: Option<u16>,
-    /// DNS upstream for TUN mode: plain "ip[:port]" or DoT/DoH via "tls://host" /
-    /// "https://host/path".
-    #[arg(long)]
-    dns: Option<String>,
-    /// TUN split mode: "exclude" (listed sites bypass the tunnel) or "include" (only
-    /// listed sites use it).
-    #[arg(long, value_parser = ["exclude", "include"])]
-    split_mode: Option<String>,
-    /// Comma-separated domains/IPs for --split-mode ("*.ya.ru,example.com").
-    #[arg(long)]
-    split_domains: Option<String>,
+    /// Yandex bot-check handling: "off" (default) or "headless_browser" (needs a
+    /// local Chrome/Chromium install).
+    #[arg(long, value_parser = ["off", "headless_browser"])]
+    captcha_solve_mode: Option<String>,
 }
 
 #[derive(clap::ValueEnum, Clone, Copy)]
@@ -123,6 +135,32 @@ impl From<ProfileModeArg> for ProfileMode {
 }
 
 #[derive(Args)]
+struct SettingsArgs {
+    /// Local SOCKS5 listen port.
+    #[arg(long)]
+    socks_port: Option<u16>,
+    /// TUN DNS upstream: plain "ip[:port]" or DoT/DoH via "tls://host" /
+    /// "https://host/path".
+    #[arg(long)]
+    dns: Option<String>,
+    /// Split-tunnel mode: "none" (off), "exclude" (listed sites bypass the tunnel) or
+    /// "include" (only listed sites use the tunnel).
+    #[arg(long, value_parser = ["none", "exclude", "include"])]
+    split_mode: Option<String>,
+    /// Comma-separated domains/IPs for --split-mode ("*.ya.ru,example.com"; "" clears).
+    #[arg(long)]
+    split_domains: Option<String>,
+}
+
+#[derive(Subcommand)]
+enum SettingsCmd {
+    /// Print the current global settings.
+    Show,
+    /// Change the global settings (only the flags you pass are touched).
+    Set(SettingsArgs),
+}
+
+#[derive(Args)]
 struct ActiveArgs {
     /// Profile name (defaults to the active profile).
     name: Option<String>,
@@ -137,19 +175,31 @@ struct RmProfileArgs {
 struct EditProfileArgs {
     /// Target profile name.
     name: String,
+    /// Transport implementation.
+    #[arg(long, value_parser = ["yandex", "volga", "oneme", "yandex_multistream", "cupsonline", "mailru", "boards"])]
+    transport: Option<String>,
+    /// Wire codec for non-Yandex transports.
+    #[arg(long, value_parser = ["legacy", "batched"])]
+    codec: Option<String>,
+    /// Comma-separated document URLs for yandex_multistream.
+    #[arg(long)]
+    doc_urls: Option<String>,
+    /// Manual document URL for single-document transports.
+    #[arg(long)]
+    doc_url: Option<String>,
+    /// OneMe MAX token.
+    #[arg(long)]
+    max_token: Option<String>,
+    /// OneMe target user id.
+    #[arg(long)]
+    max_uid: Option<String>,
     /// Parallel WebSocket streams (multistream, 1-8).
     #[arg(long)]
     streams: Option<u16>,
-    /// DNS upstream for TUN mode: plain "ip[:port]" or DoT/DoH ("tls://host",
-    /// "https://host/path").
-    #[arg(long)]
-    dns: Option<String>,
-    /// TUN split mode: "none", "exclude" or "include".
-    #[arg(long, value_parser = ["none", "exclude", "include"])]
-    split_mode: Option<String>,
-    /// Comma-separated domains/IPs for --split-mode ("" clears the list).
-    #[arg(long)]
-    split_domains: Option<String>,
+    /// Yandex bot-check handling: "off" or "headless_browser" (needs a local
+    /// Chrome/Chromium install).
+    #[arg(long, value_parser = ["off", "headless_browser"])]
+    captcha_solve_mode: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -173,6 +223,9 @@ struct ConnectArgs {
     /// Override the SOCKS5 listen port.
     #[arg(long)]
     socks_port: Option<u16>,
+    /// Verbose engine logging for this run only (transport internals, packet traces).
+    #[arg(long)]
+    debug: bool,
 }
 
 #[derive(Subcommand)]
@@ -207,6 +260,8 @@ struct Ctx {
 }
 
 fn main() -> Result<()> {
+    // A closed stdout must end the process, not panic it with "failed printing to stdout".
+    openflux::restore_default_sigpipe();
     // pkexec (and some sudo configs) trim the root PATH, dropping /usr/sbin:/sbin where
     // `ip` lives; prepend them so tun.rs can find it as root. Unix-only: Windows has no
     // iproute2 / pkexec equivalent in the same code path.
@@ -232,6 +287,7 @@ fn main() -> Result<()> {
         Command::ListProfiles => list_profiles(&ctx),
         Command::RmProfile(a) => rm_profile(&ctx, &a.name),
         Command::EditProfile(a) => edit_profile(&ctx, a),
+        Command::Settings(cmd) => settings(&ctx, cmd),
         Command::SetActive(a) => {
             let name = a.name.context("set-active needs a profile name")?;
             println!("{}", actions::set_active(&ctx.paths, &name)?);
@@ -244,6 +300,7 @@ fn main() -> Result<()> {
                 &ctx.engine_bin,
                 a.name.as_deref(),
                 a.socks_port,
+                a.debug,
             )?;
             println!(
                 "engine running (pid {}), SOCKS5 at 127.0.0.1:{}\n  next: `openflux tun on` (sudo) or `openflux proxy on`",
@@ -288,8 +345,15 @@ fn main() -> Result<()> {
                 Ok(())
             }
             TunCmd::Off => {
-                if actions::tun_down(&ctx.paths)? {
+                let down = actions::tun_down(&ctx.paths)?;
+                if down.was_up {
                     println!("TUN mode down");
+                }
+                if let Some(pid) = down.engine_stopped {
+                    println!("engine stopped (was pid {pid})");
+                }
+                if let Some(w) = down.engine_warning {
+                    println!("warning: {w}");
                 }
                 Ok(())
             }
@@ -368,46 +432,83 @@ fn save_config(ctx: &Ctx, cfg: &AppConfig) -> Result<()> {
     cfg.save(&ctx.paths.config_file)
 }
 
+fn parse_transport(value: Option<&str>) -> Result<Transport> {
+    value
+        .map(|value| value.parse::<Transport>().map_err(anyhow::Error::msg))
+        .transpose()?
+        .map_or(Ok(Transport::Yandex), Ok)
+}
+
+fn parse_codec(value: Option<&str>) -> Result<Codec> {
+    value
+        .map(|value| value.parse::<Codec>().map_err(anyhow::Error::msg))
+        .transpose()?
+        .map_or(Ok(Codec::Legacy), Ok)
+}
+
+fn parse_csv_values(csv: &str) -> Vec<String> {
+    openflux::config::parse_doc_urls(csv)
+}
+
 fn add_profile(ctx: &Ctx, a: AddProfileArgs) -> Result<()> {
+    let transport = parse_transport(a.transport.as_deref())?;
+    let codec = parse_codec(a.codec.as_deref())?;
+    let doc_urls = a
+        .doc_urls
+        .as_deref()
+        .map(parse_csv_values)
+        .unwrap_or_default();
     let mut cfg = load_config(ctx)?;
     let mut profile = match a.mode.into() {
         ProfileMode::Manual => {
-            let url = a
-                .doc_url
-                .context("manual profiles need --doc-url")?;
+            let url = if transport == Transport::Oneme || transport == Transport::YandexMultistream
+            {
+                String::new()
+            } else {
+                a.doc_url
+                    .as_deref()
+                    .context("manual profiles need --doc-url")?
+                    .to_string()
+            };
             Profile::manual(&a.name, &url)
         }
         ProfileMode::Key => {
             let control = a
                 .control_url
-                .context("key profiles need --control-url")?;
+                .as_deref()
+                .context("key profiles need --control-url")?
+                .to_string();
             let token = a
                 .key_token
-                .context("key profiles need --key-token")?;
+                .as_deref()
+                .context("key profiles need --key-token")?
+                .to_string();
             Profile::key(&a.name, &control, &token)
         }
     };
-    if let Some(port) = a.socks_port {
-        profile.socks_port = port;
+    profile.transport = transport;
+    profile.codec = codec;
+    profile.doc_urls = doc_urls;
+    if let Some(value) = a.max_token {
+        profile.max_token = value;
+    }
+    if let Some(value) = a.max_uid {
+        profile.max_uid = value;
     }
     if let Some(mtu) = a.mtu {
         profile.mtu = mtu;
     }
     if let Some(streams) = a.streams {
         profile.streams = streams;
+    } else if transport == Transport::YandexMultistream && profile.doc_urls.len() >= 2 {
+        profile.streams = u16::try_from(profile.doc_urls.len()).unwrap_or(u16::MAX);
     }
-    if let Some(dns) = a.dns {
-        profile.dns_upstream = dns;
-    }
-    if let Some(mode) = a.split_mode {
-        profile.split_mode = mode;
-    }
-    if let Some(domains) = a.split_domains {
-        profile.split_sites = parse_split_domains(&domains);
+    if let Some(mode) = a.captcha_solve_mode {
+        profile.captcha_solve_mode = openflux::config::normalize_captcha_mode(&mode);
     }
     cfg.add(profile)?;
     save_config(ctx, &cfg)?;
-    println!("profile '{}' added", a.name);
+    println!("profile '{}' added (transport={})", a.name, transport);
     Ok(())
 }
 
@@ -416,55 +517,79 @@ fn edit_profile(ctx: &Ctx, a: EditProfileArgs) -> Result<()> {
     let profile = cfg
         .get_mut(&a.name)
         .with_context(|| format!("profile '{}' not found", a.name))?;
+    if let Some(value) = a.transport {
+        profile.transport = parse_transport(Some(&value))?;
+    }
+    if let Some(value) = a.codec {
+        profile.codec = parse_codec(Some(&value))?;
+    }
+    if let Some(value) = a.doc_url {
+        profile.doc_url = value;
+    }
+    if let Some(value) = a.doc_urls {
+        profile.doc_urls = parse_csv_values(&value);
+    }
+    match profile.transport {
+        Transport::YandexMultistream => {
+            profile.doc_url.clear();
+            if profile.doc_urls.len() >= 2 {
+                profile.streams = u16::try_from(profile.doc_urls.len()).unwrap_or(u16::MAX);
+            }
+        }
+        Transport::Oneme => {
+            profile.doc_url.clear();
+            profile.doc_urls.clear();
+        }
+        _ => profile.doc_urls.clear(),
+    }
+    if let Some(value) = a.max_token {
+        profile.max_token = value;
+    }
+    if let Some(value) = a.max_uid {
+        profile.max_uid = value;
+    }
     if let Some(streams) = a.streams {
         profile.streams = streams;
     }
-    if let Some(dns) = a.dns {
-        profile.dns_upstream = dns;
-    }
-    if let Some(mode) = a.split_mode {
-        profile.split_mode = if mode == "none" { String::new() } else { mode };
-        if profile.split_mode.is_empty() {
-            profile.split_sites.clear();
+    match a.captcha_solve_mode {
+        Some(value) => {
+            profile.captcha_solve_mode = openflux::config::normalize_captcha_mode(&value)
         }
-    }
-    if let Some(domains) = a.split_domains {
-        profile.split_sites = parse_split_domains(&domains);
+        None if !profile.transport.supports_captcha_solve() => profile.captcha_solve_mode.clear(),
+        None => {}
     }
     profile.validate()?;
-    if profile.split_mode.is_empty() {
-        profile.split_sites.clear();
-    }
-    let (streams, dns, split_mode, split_sites) = (
+    let (transport, streams, mtu, captcha_solve_mode) = (
+        profile.transport,
         profile.streams,
-        profile.dns_upstream.clone(),
-        profile.split_mode.clone(),
-        profile.split_sites.clone(),
+        profile.mtu,
+        profile.captcha_solve_mode.clone(),
     );
+    // Every value printed below is copied out above, so the borrow of `cfg` is already dead
+    // here and the config can be written back.
     save_config(ctx, &cfg)?;
     println!(
-        "profile '{}' updated: streams={}, dns={}, split_mode={}, split_sites=[{}]",
+        "profile '{}' updated: transport={transport}, streams={streams}, mtu={mtu}, captcha_solve_mode={}",
         a.name,
-        streams,
-        dns,
-        if split_mode.is_empty() { "off" } else { &split_mode },
-        split_sites.join(","),
+        if captcha_solve_mode.is_empty() { "off" } else { &captcha_solve_mode },
     );
+    println!("note: DNS, split and the SOCKS5 port are global - see `openflux settings`");
     Ok(())
 }
 
 /// Parse a comma-separated split list, trimming leading dots ("*.ya.ru, .yandex.ru"
 /// normalise to "*.ya.ru,yandex.ru").
 fn parse_split_domains(csv: &str) -> Vec<String> {
-    csv.split(',')
-        .map(|s| s.trim().trim_start_matches('.').to_string())
-        .filter(|s| !s.is_empty())
-        .collect()
+    openflux::config::normalize_split_domains(csv)
 }
 
 fn import_profile(ctx: &Ctx, a: ImportArgs) -> Result<()> {
-    let profile = openflux::import::import_link(&a.link)?;
+    let imported = openflux::import::import_link(&a.link)?;
+    let profile = imported.profile;
     let mut cfg = load_config(ctx)?;
+    // DNS is a machine-wide setting, so a link that carries one configures it globally
+    // instead of ending up as per-profile data.
+    let imported_dns = imported.dns.filter(|d| !d.trim().is_empty());
     if cfg.get(&profile.name).is_some() {
         bail!(
             "profile '{}' already exists; remove it first (`openflux rm-profile {}`)",
@@ -473,20 +598,74 @@ fn import_profile(ctx: &Ctx, a: ImportArgs) -> Result<()> {
         );
     }
     cfg.add(profile.clone())?;
+    if let Some(dns) = imported_dns {
+        cfg.dns = dns;
+    }
+    cfg.validate()?;
     save_config(ctx, &cfg)?;
     println!(
-        "imported profile '{}' ({}):\n  control_url={}\n  doc_url={}\n  e2e={}\n  active: {}",
+        "imported profile '{}' ({}):\n  control_url={}\n  transport={}\n  codec={}\n  doc_url={}\n  e2e={}\n  active: {}",
         profile.name,
         match profile.mode {
             ProfileMode::Manual => "manual",
             ProfileMode::Key => "key",
         },
         profile.control_url,
+        profile.transport,
+        profile.codec,
         profile.doc_url,
         profile.e2e_encryption,
         cfg.active_profile.as_deref() == Some(&profile.name),
     );
     Ok(())
+}
+
+/// Print the machine-wide settings. DNS, split and the SOCKS5 port describe the machine
+/// rather than the account, so they are stored once and shared by every profile.
+fn show_settings(cfg: &openflux::config::AppConfig) {
+    println!("{}", actions::settings_summary(cfg));
+    if !cfg.split_enabled() && !cfg.split_sites.is_empty() {
+        println!("note: a site list is stored but split is off; it is ignored until you set a mode");
+    }
+}
+
+fn settings(ctx: &Ctx, cmd: SettingsCmd) -> Result<()> {
+    match cmd {
+        SettingsCmd::Show => {
+            let cfg = load_config(ctx)?;
+            show_settings(&cfg);
+            Ok(())
+        }
+        SettingsCmd::Set(a) => {
+            let mut cfg = load_config(ctx)?;
+            if let Some(port) = a.socks_port {
+                cfg.socks_port = port;
+            }
+            if let Some(dns) = a.dns {
+                let dns = dns.trim().to_string();
+                if dns.is_empty() {
+                    bail!("--dns must not be empty");
+                }
+                cfg.dns = dns;
+            }
+            if let Some(mode) = a.split_mode {
+                cfg.split_mode = if mode == "none" { String::new() } else { mode };
+                if cfg.split_mode.is_empty() {
+                    cfg.split_sites.clear();
+                }
+            }
+            if let Some(domains) = a.split_domains {
+                cfg.split_sites = parse_split_domains(&domains);
+            }
+            cfg.validate()?;
+            if !cfg.split_enabled() {
+                cfg.split_sites.clear();
+            }
+            save_config(ctx, &cfg)?;
+            show_settings(&cfg);
+            Ok(())
+        }
+    }
 }
 
 fn list_profiles(ctx: &Ctx) -> Result<()> {
@@ -496,36 +675,32 @@ fn list_profiles(ctx: &Ctx) -> Result<()> {
         return Ok(());
     }
     for p in &cfg.profiles {
-        let active = if cfg.active_profile.as_deref() == Some(&p.name) { " (active)" } else { "" };
+        let active = if cfg.active_profile.as_deref() == Some(&p.name) {
+            " (active)"
+        } else {
+            ""
+        };
         let mode = match p.mode {
             ProfileMode::Manual => "manual",
             ProfileMode::Key => "key",
         };
-        let doc = match &p.mode {
-            ProfileMode::Manual => p.doc_url.clone(),
-            ProfileMode::Key => p
-                .doc_url
-                .clone()
-                .pipe_empty("(not resolved; run `openflux check-key`)"),
+        let doc = match p.transport {
+            Transport::YandexMultistream if !p.doc_urls.is_empty() => p.doc_urls.join(","),
+            _ if p.doc_url.is_empty() && p.mode == ProfileMode::Key => {
+                "(not resolved; run `openflux check-key`)".to_string()
+            }
+            _ => p.doc_url.clone(),
         };
-        println!("- {}{}\n    mode={mode}\n    doc_url={doc}\n    socks_port={}",
-            p.name, active, p.socks_port);
+        println!(
+            "- {}{}\n    mode={mode}\n    transport={}\n    codec={}\n    doc_url={doc}\n    captcha_solve_mode={}",
+            p.name,
+            active,
+            p.transport,
+            p.codec,
+            if p.captcha_solve_mode.is_empty() { "off" } else { &p.captcha_solve_mode },
+        );
     }
     Ok(())
-}
-
-trait PipeEmpty {
-    fn pipe_empty(self, alt: &str) -> String;
-}
-
-impl PipeEmpty for String {
-    fn pipe_empty(self, alt: &str) -> String {
-        if self.is_empty() {
-            alt.to_string()
-        } else {
-            self
-        }
-    }
 }
 
 fn rm_profile(ctx: &Ctx, name: &str) -> Result<()> {
@@ -538,7 +713,9 @@ fn rm_profile(ctx: &Ctx, name: &str) -> Result<()> {
 
 fn check_key(ctx: &Ctx, a: ActiveArgs) -> Result<()> {
     let mut cfg = load_config(ctx)?;
-    let name = a.name.unwrap_or_else(|| cfg.active_profile.clone().unwrap_or_default());
+    let name = a
+        .name
+        .unwrap_or_else(|| cfg.active_profile.clone().unwrap_or_default());
     {
         let profile = cfg
             .get_mut(&name)
@@ -558,15 +735,22 @@ fn check_key(ctx: &Ctx, a: ActiveArgs) -> Result<()> {
     };
     let result = resolve::resolve_key(&control_url, &key_token)?;
     let e2e = result.e2e_encryption;
+    let transport = result.transport;
     {
         let p = cfg.get_mut(&name).unwrap();
         p.doc_url = result.doc_url.clone();
         p.doc_urls = result.doc_urls.clone();
+        p.transport = transport;
         p.e2e_encryption = e2e;
+        if transport == Transport::YandexMultistream && p.doc_urls.len() >= 2 {
+            p.streams = u16::try_from(p.doc_urls.len()).unwrap_or(u16::MAX);
+        }
+        p.validate()?;
     }
     save_config(ctx, &cfg)?;
 
     println!("key resolved for '{}':", name);
+    println!("  transport={transport}");
     println!("  doc_url={}", result.doc_url);
     println!("  e2e_encryption={e2e}");
     println!("key is active; run `openflux connect {name}`");
@@ -575,7 +759,10 @@ fn check_key(ctx: &Ctx, a: ActiveArgs) -> Result<()> {
 
 fn status(ctx: &Ctx) -> Result<()> {
     let s = actions::status(&ctx.paths)?;
-    println!("profile: {}", s.active_profile.as_deref().unwrap_or("<none>"));
+    println!(
+        "profile: {}",
+        s.active_profile.as_deref().unwrap_or("<none>")
+    );
 
     match &s.engine {
         Some(e) if e.mode == "tun" => println!("engine: running (pid {}), mode=tun", e.pid),
@@ -601,6 +788,7 @@ fn status(ctx: &Ctx) -> Result<()> {
         }
     };
     println!("proxy: {proxy_mode}");
+    println!("settings: {}", actions::settings_summary(&load_config(ctx)?));
     Ok(())
 }
 
@@ -613,10 +801,71 @@ fn logs(ctx: &Ctx, a: LogsArgs) -> Result<()> {
     let lines = a.lines.max(1);
     // Rough: 120 bytes per line is a fair average for log output.
     let text = engine::tail(path, lines * 120)?;
-    let printed: Vec<&str> = text.lines().skip(text.lines().count().saturating_sub(lines)).collect();
+    let printed: Vec<&str> = text
+        .lines()
+        .skip(text.lines().count().saturating_sub(lines))
+        .collect();
     println!("{}", printed.join("\n"));
     if a.follow {
         engine::follow(path, Duration::from_millis(500))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transport_parsing_covers_every_known_value() {
+        for transport in Transport::ALL {
+            assert_eq!(
+                parse_transport(Some(transport.as_str())).unwrap(),
+                *transport
+            );
+        }
+        assert_eq!(parse_transport(None).unwrap(), Transport::Yandex);
+        assert!(parse_transport(Some("carrier-pigeon")).is_err());
+    }
+
+    #[test]
+    fn codec_parsing_defaults_to_legacy() {
+        assert_eq!(parse_codec(None).unwrap(), Codec::Legacy);
+        assert_eq!(parse_codec(Some("legacy")).unwrap(), Codec::Legacy);
+        assert_eq!(parse_codec(Some("batched")).unwrap(), Codec::Batched);
+        assert!(parse_codec(Some("zstd")).is_err());
+    }
+
+    #[test]
+    fn csv_parsing_trims_and_drops_empties() {
+        let values = parse_csv_values(" https://a , ,https://b,");
+        assert_eq!(
+            values,
+            vec!["https://a".to_string(), "https://b".to_string()]
+        );
+        assert!(parse_csv_values("  ,  ").is_empty());
+    }
+
+    #[test]
+    fn split_domain_parsing_normalises_leading_dots() {
+        let domains = parse_split_domains("*.ya.ru, .yandex.ru ,example.com");
+        assert_eq!(
+            domains,
+            vec![
+                "*.ya.ru".to_string(),
+                "yandex.ru".to_string(),
+                "example.com".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn captcha_mode_normalisation_stores_off_as_empty() {
+        let mode = openflux::config::normalize_captcha_mode;
+        assert_eq!(mode("off"), "");
+        assert_eq!(mode(" off "), "");
+        assert_eq!(mode(""), "");
+        assert_eq!(mode("headless_browser"), "headless_browser");
+        assert_eq!(mode(" headless_browser "), "headless_browser");
+    }
 }

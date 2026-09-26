@@ -11,20 +11,26 @@
 //     dialing the real destinations on this machine's behalf. No TUN fd or listener
 //     needed; the tunnel carries the peers' traffic.
 //
-// Core features the shim can turn on: multiple parallel WebSocket streams
-// (--streams, multistream), per-domain split tunneling for TUN mode
-// (--split-mode/--split-sites, exclusive or inclusive), and encrypted DNS upstreams
-// (--dns accepts plain, tls://… for DoT and https://… for DoH).
+// Core features the shim can turn on: a selectable transport (--transport: yandex,
+// yandex_multistream, volga, oneme, cupsonline, mailru, boards) with its wire codec
+// (--codec, ignored by the self-compressing Yandex transport, which is always batched),
+// multiple parallel WebSocket streams (--streams, multistream), per-domain split tunneling
+// for TUN mode (--split-mode/--split-sites, exclusive or inclusive), and encrypted DNS
+// upstreams (--dns accepts plain, tls://… for DoT and https://… for DoH).
 package main
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -32,36 +38,53 @@ import (
 	"universal-bypass-tool/gateway"
 	"universal-bypass-tool/socks5"
 	"universal-bypass-tool/transport"
+	"universal-bypass-tool/transport/cupsonline"
+	"universal-bypass-tool/transport/mailru"
+	"universal-bypass-tool/transport/oneme"
 	"universal-bypass-tool/transport/yandex"
 	"universal-bypass-tool/tunnel"
 	"universal-bypass-tool/utils"
 )
 
+type cookieProvider interface {
+	ProvideCookies(string)
+}
+
 func main() {
-	url := flag.String("url", "", "Yandex Docs document URL")
-	socksAddr := flag.String("socks5", "127.0.0.1:1080", "SOCKS5 listen address (SOCKS5 mode)")
-	tunFD := flag.Int("tun-fd", 0, "inherited TUN fd (Unix); when > 0 runs the gateway in TUN mode")
-	tunRead := flag.Int("tun-read", 0, "inherited TUN read handle (Windows); with --tun-write runs the gateway in TUN mode")
-	tunWrite := flag.Int("tun-write", 0, "inherited TUN write handle (Windows); with --tun-read runs the gateway in TUN mode")
-	exit := flag.Bool("exit", false, "run as an exit node for other peers instead of a local client")
-	exitMode := flag.String("exit-mode", "raw", "exit-node mode: raw (needs root, full TCP/UDP) or proxy (no root, TCP-only)")
-	streams := flag.Int("streams", 1, "number of parallel WebSocket streams (multistream)")
-	splitMode := flag.String("split-mode", "", "TUN split tunneling: 'exclude' (listed sites bypass the tunnel) or 'include' (only listed sites use the tunnel)")
-	splitSites := flag.String("split-sites", "", "comma-separated domains/IPs for --split-mode (suffix wildcards like '*.ru' allowed)")
-	dns := flag.String("dns", "77.88.8.8", "upstream DNS for the TUN gateway (plain IP[:port], tls://host for DoT, https://host/path for DoH)")
-	sockMark := flag.Int("sock-mark", 0, "SO_MARK set on the transport's own sockets (lets TUN-mode routing exempt them from its own tunnel)")
-	token := flag.String("token", "", "e2e key token; enables encrypted self-compression for this key")
+	url := flag.String("url", "", "document URL")
+	docURLs := flag.String("urls", "", "comma-separated document URLs for yandex_multistream")
+	transportType := flag.String("transport", "yandex", "transport type")
+	codecName := flag.String("codec", "legacy", "wire codec")
+	socksAddr := flag.String("socks5", "127.0.0.1:1080", "SOCKS5 listen address")
+	tunFD := flag.Int("tun-fd", 0, "inherited TUN fd")
+	tunRead := flag.Int("tun-read", 0, "inherited TUN read handle")
+	tunWrite := flag.Int("tun-write", 0, "inherited TUN write handle")
+	exit := flag.Bool("exit", false, "run as an exit node")
+	exitNode := flag.Bool("exit-node", false, "run as an exit node")
+	exitMode := flag.String("exit-mode", "raw", "exit-node mode")
+	streams := flag.Int("streams", 1, "number of parallel streams")
+	splitMode := flag.String("split-mode", "", "TUN split tunneling mode")
+	splitSites := flag.String("split-sites", "", "comma-separated split-tunnel sites")
+	dns := flag.String("dns", "77.88.8.8", "upstream DNS")
+	sockMark := flag.Int("sock-mark", 0, "SO_MARK for transport sockets")
+	token := flag.String("token", "", "e2e key token")
 	mtu := flag.Uint("mtu", 0, "optional tunnel MTU override")
 	debug := flag.Bool("debug", false, "verbose debug logging")
+	var maxToken string
+	var maxUID string
+	var captchaMode string
+	flag.StringVar(&maxToken, "max-token", "", "OneMe MAX token")
+	flag.StringVar(&maxToken, "maxToken", "", "OneMe MAX token")
+	flag.StringVar(&maxUID, "max-uid", "", "OneMe target user ID")
+	flag.StringVar(&maxUID, "maxUid", "", "OneMe target user ID")
+	flag.StringVar(&captchaMode, "captcha-solve-mode", "off", "Yandex CAPTCHA handling")
 	flag.Parse()
 
-	if *url == "" {
-		log.Fatalf("[ENGINE] -url is required")
-	}
+	isExit := *exit || *exitNode
 	if *streams < 1 {
 		log.Fatalf("[ENGINE] -streams must be >= 1")
 	}
-	if !*exit && *tunFD <= 0 && *tunRead <= 0 && *socksAddr == "" {
+	if !isExit && *tunFD <= 0 && *tunRead <= 0 && *socksAddr == "" {
 		log.Fatalf("[ENGINE] either -tun-fd/--tun-read, -socks5, or -exit is required")
 	}
 
@@ -69,51 +92,39 @@ func main() {
 		utils.EnableDebug()
 	}
 	if *sockMark != 0 {
-		// protectControl only runs when a protector is installed. SO_MARK needs
-		// CAP_NET_ADMIN; without it the setsockopt fails and the socket is still usable, so
-		// always return true (never treat a failed mark as a dial failure). See
-		// sockmark_unix.go / sockmark_windows.go.
 		installSockMarkProtector(*sockMark)
 	}
 	if *tunFD > 0 || *tunRead > 0 {
-		// The transport marks its WS/HTTP sockets, but name resolution would otherwise use
-		// the OS resolver (unmarked) and get captured by our own TUN before the tunnel is
-		// up - a bootstrap deadlock. Route the engine's own lookups through the marked
-		// resolver so they always leave via the physical link.
 		net.DefaultResolver = transport.ProtectedResolver()
 	}
 
-	// One transport per stream; >1 turns on multistream (each stream a parallel WS
-	// connection, frames hashed to a stream by port-pair).
-	var trans transport.Transport
-	if *streams <= 1 {
-		tr := buildStream(*url, *token, *exit, 0)
-		if err := tr.Start(); err != nil {
-			log.Fatalf("[ENGINE] start transport: %v", err)
-		}
-		trans = tr
-	} else {
-		list := make([]transport.Transport, *streams)
-		for i := range list {
-			tr := buildStream(*url, *token, *exit, i)
-			if err := tr.Start(); err != nil {
-				log.Fatalf("[ENGINE] start transport stream %d: %v", i, err)
-			}
-			list[i] = tr
-		}
-		ms := transport.NewMultiStreamTransport(list)
-		ms.SetEventCallback(func(code, detail string) {
-			log.Printf("[TUNNEL] event %s (attempt %s)", code, detail)
-		})
-		log.Printf("[ENGINE] multistream: %d streams", *streams)
-		trans = ms
+	config := transport.DefaultConfig()
+	trans, providers, err := buildTransports(
+		*transportType,
+		*url,
+		*docURLs,
+		*codecName,
+		*token,
+		maxToken,
+		maxUID,
+		captchaMode,
+		isExit,
+		*streams,
+		config,
+	)
+	if err != nil {
+		log.Fatalf("[ENGINE] %v", err)
+	}
+	watchCookieCommands(providers)
+	if err := trans.Start(); err != nil {
+		log.Fatalf("[ENGINE] start transport: %v", err)
 	}
 
 	em, err := tunnel.ParseExitMode(*exitMode)
 	if err != nil {
 		log.Fatalf("[ENGINE] bad -exit-mode %q: %v", *exitMode, err)
 	}
-	tun := tunnel.NewTCPTunnelMode(trans, *exit, em)
+	tun := tunnel.NewTCPTunnelMode(trans, isExit, em)
 	if *mtu > 0 {
 		tun.SetMTU(uint32(*mtu))
 	}
@@ -124,7 +135,7 @@ func main() {
 	defer stop()
 
 	switch {
-	case *exit:
+	case isExit:
 		runExitMode(ctx, tun, trans)
 	case *tunFD > 0 || (*tunRead > 0 && *tunWrite > 0):
 		r, w, cleanup := tunFiles(*tunFD, *tunRead, *tunWrite)
@@ -137,28 +148,181 @@ func main() {
 	log.Printf("stopping")
 }
 
-// buildStream creates a single yandex transport, wired like the app's wrapYandex: batch
-// compression (or e2e-encrypted self-compression when a key token is present). Multistream
-// runs give each stream its own e2e key material via EnableEncryptedSelfCompressionForStream.
-func buildStream(url, token string, isExitNode bool, streamIndex int) *yandex.YandexDocsTransport {
-	t := yandex.NewYandexDocsTransport(url, transport.DefaultConfig())
-	t.SetEventCallback(func(code, detail string) {
-		label := ""
-		if streamIndex > 0 {
-			label = fmt.Sprintf(" (stream %d)", streamIndex)
+func buildTransports(kind, docURL, rawDocURLs, codecName, token, maxToken, maxUID, captchaMode string, isExit bool, streamCount int, config transport.TransportConfig) (transport.Transport, []cookieProvider, error) {
+	switch kind {
+	case "yandex":
+		if streamCount <= 1 {
+			tr, provider, err := buildTransport(kind, docURL, codecName, token, maxToken, maxUID, captchaMode, isExit, 0, false, config)
+			return tr, providerSlice(provider), err
 		}
-		log.Printf("[TUNNEL] event %s%s (attempt %s)", code, label, detail)
-	})
-	if token != "" {
-		if streamIndex > 0 {
-			t.EnableEncryptedSelfCompressionForStream(token, isExitNode, streamIndex)
-		} else {
-			t.EnableEncryptedSelfCompression(token, isExitNode)
+		streams := make([]transport.Transport, streamCount)
+		providers := make([]cookieProvider, 0, streamCount)
+		for i := range streams {
+			tr, provider, err := buildTransport(kind, docURL, codecName, token, maxToken, maxUID, captchaMode, isExit, i, i > 0, config)
+			if err != nil {
+				return nil, nil, err
+			}
+			streams[i] = tr
+			if provider != nil {
+				providers = append(providers, provider)
+			}
 		}
-	} else {
-		t.EnableSelfCompression()
+		log.Printf("[ENGINE] multistream: %d streams", streamCount)
+		return transport.NewMultiStreamTransport(streams), providers, nil
+	case "yandex_multistream":
+		urls := splitValues(rawDocURLs)
+		if len(urls) < 2 {
+			return nil, nil, fmt.Errorf("--transport yandex_multistream requires --urls with 2+ comma-separated document URLs")
+		}
+		streams := make([]transport.Transport, len(urls))
+		providers := make([]cookieProvider, 0, len(urls))
+		for i, url := range urls {
+			tr, provider, err := buildTransport(kind, url, codecName, token, maxToken, maxUID, captchaMode, isExit, i, true, config)
+			if err != nil {
+				return nil, nil, err
+			}
+			streams[i] = tr
+			if provider != nil {
+				providers = append(providers, provider)
+			}
+		}
+		log.Printf("[ENGINE] yandex multistream: %d document streams", len(urls))
+		return transport.NewMultiStreamTransport(streams), providers, nil
+	default:
+		if streamCount != 1 {
+			log.Printf("[ENGINE] ignoring --streams=%d for transport %s", streamCount, kind)
+		}
+		tr, provider, err := buildTransport(kind, docURL, codecName, token, maxToken, maxUID, captchaMode, isExit, 0, false, config)
+		return tr, providerSlice(provider), err
 	}
-	return t
+}
+
+func buildTransport(kind, docURL, codecName, token, maxToken, maxUID, captchaMode string, isExit bool, streamIndex int, perStreamKey bool, config transport.TransportConfig) (transport.Transport, cookieProvider, error) {
+	var inner transport.Transport
+	setEvents := func(tr transport.Transport) {
+		tr.SetEventCallback(func(code, detail string) {
+			label := ""
+			if streamIndex > 0 {
+				label = fmt.Sprintf(" (stream %d)", streamIndex)
+			}
+			log.Printf("[TUNNEL] event %s%s (attempt %s)", code, label, detail)
+		})
+	}
+	wrapCodec := func(tr transport.Transport) (transport.Transport, error) {
+		return transport.WrapCodec(tr, codecName)
+	}
+
+	switch kind {
+	case "yandex", "yandex_multistream":
+		if strings.TrimSpace(docURL) == "" {
+			return nil, nil, fmt.Errorf("transport %s requires a document URL", kind)
+		}
+		yd := yandex.NewYandexDocsTransport(docURL, config)
+		yd.SetCaptchaSolveMode(parseCaptchaSolveMode(captchaMode))
+		setEvents(yd)
+		if token != "" {
+			if perStreamKey {
+				yd.EnableEncryptedSelfCompressionForStream(token, isExit, streamIndex)
+			} else {
+				yd.EnableEncryptedSelfCompression(token, isExit)
+			}
+		} else {
+			yd.EnableSelfCompression()
+		}
+		return yd, yd, nil
+	case "boards":
+		if strings.TrimSpace(docURL) == "" {
+			return nil, nil, fmt.Errorf("transport boards requires a document URL")
+		}
+		yd := yandex.NewBoardsTransport(docURL, config)
+		setEvents(yd)
+		return transport.NewBatchedTransport(yd), yd, nil
+	case "volga":
+		if strings.TrimSpace(docURL) == "" {
+			return nil, nil, fmt.Errorf("transport volga requires a document URL")
+		}
+		inner = yandex.NewYandexVolgaTransport(docURL, config)
+		setEvents(inner)
+		wrapped, err := wrapCodec(inner)
+		return wrapped, nil, err
+	case "oneme":
+		uid, err := strconv.ParseInt(maxUID, 10, 64)
+		if err != nil || uid <= 0 {
+			return nil, nil, fmt.Errorf("oneme requires a positive numeric --max-uid")
+		}
+		if strings.TrimSpace(maxToken) == "" {
+			return nil, nil, fmt.Errorf("oneme requires --max-token")
+		}
+		inner = oneme.NewOneMeTransport(isExit, maxToken, uid, config)
+		setEvents(inner)
+		wrapped, err := wrapCodec(inner)
+		return wrapped, nil, err
+	case "cupsonline":
+		if strings.TrimSpace(docURL) == "" {
+			return nil, nil, fmt.Errorf("transport cupsonline requires a document URL")
+		}
+		inner = cupsonline.NewCupsonlineTransport(docURL, config, !isExit)
+		setEvents(inner)
+		wrapped, err := wrapCodec(inner)
+		return wrapped, nil, err
+	case "mailru":
+		if strings.TrimSpace(docURL) == "" {
+			return nil, nil, fmt.Errorf("transport mailru requires a document URL")
+		}
+		inner = mailru.NewMailruDocsTransport(docURL, config)
+		setEvents(inner)
+		wrapped, err := wrapCodec(inner)
+		return wrapped, nil, err
+	default:
+		return nil, nil, fmt.Errorf("unknown transport type %q", kind)
+	}
+}
+
+func providerSlice(provider cookieProvider) []cookieProvider {
+	if provider == nil {
+		return nil
+	}
+	return []cookieProvider{provider}
+}
+
+func splitValues(raw string) []string {
+	parts := strings.Split(raw, ",")
+	values := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if value := strings.TrimSpace(part); value != "" {
+			values = append(values, value)
+		}
+	}
+	return values
+}
+
+func watchCookieCommands(providers []cookieProvider) {
+	if len(providers) == 0 {
+		return
+	}
+	go func() {
+		scanner := bufio.NewScanner(os.Stdin)
+		scanner.Buffer(make([]byte, 4096), 1024*1024)
+		for scanner.Scan() {
+			var command struct {
+				Cmd       string `json:"cmd"`
+				CookieStr string `json:"cookie_str"`
+			}
+			if err := json.Unmarshal(scanner.Bytes(), &command); err != nil || command.Cmd != "ProvideCookies" {
+				continue
+			}
+			for _, provider := range providers {
+				provider.ProvideCookies(command.CookieStr)
+			}
+		}
+	}()
+}
+
+func parseCaptchaSolveMode(value string) yandex.CaptchaSolveMode {
+	if value == "headless_browser" {
+		return yandex.CaptchaSolveModeHeadlessBrowser
+	}
+	return yandex.CaptchaSolveModeOff
 }
 
 // startWatchdog logs, unconditionally (no --debug needed), whether the tunnel is actually

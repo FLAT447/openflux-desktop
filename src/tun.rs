@@ -9,7 +9,7 @@
 #[derive(Debug, Clone)]
 pub struct TunConfig {
     pub engine_bin: std::path::PathBuf,
-    pub url: String,
+    pub transport: crate::engine::TransportConfig,
     pub token: Option<String>,
     pub tun_name: String,
     pub tun_addr: String,

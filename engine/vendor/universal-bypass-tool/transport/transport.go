@@ -31,6 +31,8 @@ const (
 	EventConnecting = "connecting"
 	EventConnected  = "connected"
 	EventRetrying   = "retrying"
+	// EventCaptchaRequired's detail is the doc_url that needs solving.
+	EventCaptchaRequired = "captcha_required"
 )
 
 type TransportStats struct {
