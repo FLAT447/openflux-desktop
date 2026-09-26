@@ -39,6 +39,17 @@ jobs:
       - name: Test (cargo test)
         run: make test
 
+      # The Linux runner never compiles the #[cfg(windows)] branches, so a mistake in them
+      # survives every push here and only breaks the real Windows job - which sits behind a
+      # release tag, i.e. after the release commit is already public. `cargo check` needs no
+      # Windows linker, just the target's std, so the whole cfg surface is type-checked on Linux
+      # in a couple of minutes.
+      - name: Check the Windows cfg on Linux
+        run: |
+          rustup target add x86_64-pc-windows-msvc
+          cargo check --locked --all-targets --target x86_64-pc-windows-msvc
+          cargo check --locked --all-targets --target x86_64-pc-windows-msvc --manifest-path gui/Cargo.toml
+
   windows-build:
     runs-on: windows-latest
     steps:
